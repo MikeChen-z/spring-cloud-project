@@ -1,0 +1,70 @@
+server:
+  port: 9000
+
+spring:
+  application:
+    name: gateway-service
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+    gateway:
+      routes:
+        # 登录接口：白名单路径，无需 token
+        # 例：POST http://localhost:9000/api/login -> lb://user-service/login
+        - id: user-login
+          uri: lb://user-service
+          predicates:
+            - Path=/api/login
+          filters:
+            - StripPrefix=1
+
+        # /api/users/** 转发到 user-service，并剥掉第一段 /api
+        # 例：GET http://localhost:9000/api/users/1 -> lb://user-service/users/1
+        - id: user-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/users/**
+          filters:
+            - StripPrefix=1
+
+        # Nacos 配置动态刷新演示接口
+        # 例：GET http://localhost:9000/api/config-demo -> lb://user-service/config-demo
+        - id: user-config-demo
+          uri: lb://user-service
+          predicates:
+            - Path=/api/config-demo
+          filters:
+            - StripPrefix=1
+
+        # /api/orders/** 转发到 order-service（order 内部再 Feign 调 user）
+        # 例：GET http://localhost:9000/api/orders/1 -> lb://order-service/orders/1
+        - id: order-service
+          uri: lb://order-service
+          predicates:
+            - Path=/api/orders/**
+          filters:
+            - StripPrefix=1
+
+# 鉴权配置
+auth:
+  # 白名单：以下路径前缀的请求不做 JWT 校验（登录接口本身不可能带 token）
+  white-list:
+    - /api/login
+
+# JWT 验签密钥：必须与 user-service 的 jwt.secret 完全一致，否则所有合法 token 都会验签失败
+jwt:
+  secret: study-cloud-jwt-secret-key-2026-09-29-change-me-please-32bytes
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: '*'
+  # 链路追踪：100% 采样，上报到 Zipkin
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://127.0.0.1:9411/api/v2/spans

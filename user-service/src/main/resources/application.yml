@@ -1,0 +1,59 @@
+server:
+  port: 8081
+
+spring:
+  application:
+    # 注册到 Nacos 的服务名，后续 Feign、Gateway 都用这个名字找到它
+    name: user-service
+  cloud:
+    nacos:
+      # 服务注册与发现
+      discovery:
+        server-addr: 127.0.0.1:8848
+      # 配置中心
+      config:
+        server-addr: 127.0.0.1:8848
+        file-extension: yaml
+  # 数据源：把密码改成你本机 MySQL 的密码
+  datasource:
+    url: jdbc:mysql://127.0.0.1:3306/study_cloud?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true
+    username: root
+    password: 123456
+    driver-class-name: com.mysql.cj.jdbc.Driver
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+
+  # Spring Cloud 2023 标准方式：通过 config.import 拉取 Nacos 配置（无需再用 bootstrap.yml）
+  # optional: 前缀表示 Nacos 中还没有该配置时不阻断启动
+  config:
+    import:
+      - optional:nacos:user-service.yaml
+
+# JWT 配置（学习用固定密钥；生产环境应通过环境变量/Nacos 加密配置注入，并定期轮换）
+# 注意：HS256 要求密钥至少 32 字节（字节数，不是字符数）
+jwt:
+  secret: study-cloud-jwt-secret-key-2026-09-29-change-me-please-32bytes
+  # token 有效期 1 小时（单位毫秒）
+  expiration: 3600000
+
+# MyBatis-Plus
+mybatis-plus:
+  configuration:
+    map-underscore-to-camel-case: true   # t_user_name -> userName 自动驼峰映射
+    log-impl: org.apache.ibatis.logging.stdout.StdOutImpl  # 学习阶段打印 SQL 到控制台
+
+# 学习阶段暴露所有 actuator 端点（生产环境不要这么配）
+management:
+  endpoints:
+    web:
+      exposure:
+        include: '*'
+  # 链路追踪：1.0 = 100% 采样（生产环境通常 0.1 即 10%）
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://127.0.0.1:9411/api/v2/spans

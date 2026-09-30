@@ -1,0 +1,49 @@
+server:
+  port: 8082
+
+spring:
+  application:
+    name: order-service
+  cloud:
+    nacos:
+      discovery:
+        server-addr: 127.0.0.1:8848
+    # Sentinel 控制台地址（不装 Dashboard 也能用 fallback，只是看不到可视化规则）
+    # 学习阶段先不装 Dashboard，注释掉也不影响降级功能
+    sentinel:
+      transport:
+        dashboard: 127.0.0.1:8858
+  # Redis 连接配置
+  data:
+    redis:
+      host: 127.0.0.1
+      port: 6379
+  # Spring Cache 配置：底层切换为 Redis
+  cache:
+    type: redis
+    redis:
+      # key 前缀，最终 key = 前缀 + 缓存名 + :: + 参数，即 orderCache::users::1
+      # 注意：值里含冒号，YAML 必须加引号，否则解析报错
+      key-prefix: "orderCache::"
+      # 缓存存活时间 60 秒，过期自动删除
+      time-to-live: 60s
+      # 缓存 null 值，防止缓存穿透（这里降级数据走 unless 拦截，不影响）
+      cache-null-values: false
+
+# 开启 Feign 与 Sentinel 整合：Feign 调用失败时自动走 fallbackFactory
+feign:
+  sentinel:
+    enabled: true
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: '*'
+  # 链路追踪：100% 采样，上报到 Zipkin
+  tracing:
+    sampling:
+      probability: 1.0
+  zipkin:
+    tracing:
+      endpoint: http://127.0.0.1:9411/api/v2/spans

@@ -1,0 +1,26 @@
+# ===== Maven 构建产物 =====
+target/
+
+# ===== 可执行 jar（本地学习用，不纳入版本库） =====
+*.jar
+
+# ===== 根目录误解压产生的目录（保留在磁盘，不提交） =====
+BOOT-INF/
+
+# ===== IDE：IntelliJ IDEA / Eclipse / VS Code =====
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.project
+.classpath
+
+# ===== 日志文件 =====
+*.log
+logs/
+
+# ===== 系统文件 =====
+.DS_Store
+Thumbs.db
