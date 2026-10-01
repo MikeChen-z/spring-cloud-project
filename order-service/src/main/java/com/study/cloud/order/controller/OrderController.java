@@ -74,4 +74,14 @@ public class OrderController {
         result.put("source", "order-service:8082");
         return result;
     }
+
+    /**
+     * 故障接口：每次调用稳定抛异常，用于演示 Sentinel「异常比例熔断」。
+     * 资源名为 /orders/fail，熔断规则触发后该接口不再真正执行，而是直接快速失败。
+     */
+    @GetMapping("/fail")
+    public Map<String, Object> fail() {
+        log.warn("故障接口被调用，准备抛出异常");
+        throw new RuntimeException("模拟业务异常（订单服务内部故障）");
+    }
 }

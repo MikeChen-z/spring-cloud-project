@@ -99,6 +99,7 @@ java -jar gateway-service/target/gateway-service-1.0.0.jar
 | 3 | `GET /api/config-demo` | 需要 Token | Nacos 配置动态刷新演示 |
 | 4 | `GET /api/orders/{id}` | 需要 Token | 完整调用链；返回 `order`、`user`、`currentUser`（当前登录用户） |
 | 5 | `POST /api/orders` | 需要 Token | 创建订单（写接口），用于演示关联流控模式 |
+| 6 | `GET /api/orders/fail` | 需要 Token | 稳定报错接口，用于演示异常比例熔断 |
 
 Postman 推荐用法：登录接口 Tests 写 `pm.environment.set("token", pm.response.json().token);` 自动存令牌，其余请求 Authorization 用 `Bearer Token = {{token}}`。
 
@@ -110,7 +111,8 @@ Postman 推荐用法：登录接口 Tests 写 `pm.environment.set("token", pm.re
 4. **配置刷新**：Nacos 控制台修改 `user-service.yaml` 的 `user.greeting` 并发布，不重启服务再请求即可见新值
 5. **熔断降级**：停掉 user-service 后请求订单接口仍返回 200，`user` 为兜底数据（`降级用户` / `fallback@example.com`）
 6. **链路追踪**：http://localhost:9411 查看 gateway → order → user 完整瀑布图、耗时与依赖拓扑
-7. **流控限流**：对订单接口瞬间打并发请求，超过 QPS 阈值的请求返回 429（详见第七章）
+7. **流控限流**：对订单接口瞬间打并发请求，超过 QPS 阈值的请求返回 429（详见 7.3~7.5）
+8. **异常比例熔断**：连续请求 `/orders/fail`，先见真实 500、跳闸后变 429 拦截，5 秒周期反复探测（详见 7.6）
 
 > 测降级前先清缓存：`del orderCache::users::1`，否则缓存命中不会发出 Feign 请求，降级被缓存"掩盖"。
 
@@ -208,6 +210,58 @@ spring:
 
 > 注意真实资源名：本项目为 `/orders/{id}` 与 `/orders`（无 `GET:`/`POST:` 前缀）；而 Feign 出站资源是 `GET:http://user-service/users/{id}`。配置前先在 Dashboard「簇点链路」核对。
 
+### 7.6 熔断降级规则（异常比例实测）
+
+熔断与限流互补：**限流看请求量（预防），熔断看下游健康（止损）**。熔断器是三态状态机：
+
+```
+CLOSED（关闭＝通路，放行并统计）
+   │ 统计指标达阈值 → 跳闸
+   ▼
+OPEN（断开，全部快速失败，持续「熔断时长」给下游喘息）
+   │ 熔断时长结束
+   ▼
+HALF_OPEN（半开，只放 1 个探测请求）
+   ├─ 探测成功 → CLOSED（清零恢复）
+   └─ 探测失败 → 重新 OPEN（再等一轮）
+```
+
+**Dashboard 新增熔断规则**（异常比例策略）：
+
+| 字段 | 值 | 含义 |
+|------|-----|------|
+| 资源名 | `/orders/fail` | 稳定抛异常的故障接口 |
+| 熔断策略 | 异常比例 | 另两种：慢调用比例 / 异常数 |
+| 比例阈值 | 0.5 | 窗口内异常占比 ≥ 50% 跳闸 |
+| 熔断时长 | 2s | OPEN 持续时间 |
+| 最小请求数 | 5 | 窗口请求不足 5 个不触发，防偶发误判 |
+| 统计时长 | 1000ms | 滑动统计窗口 |
+
+**分阶段实测**（每批并发，观察状态机）：
+
+| 时刻 | 状态 | 结果 |
+|------|------|------|
+| t=0s | CLOSED → 跳闸 | **8 × 500**，请求真实执行；异常比例 100% > 50% |
+| t=1s | OPEN | **5 × 429**，方法体 0 执行 |
+| t=4s | HALF_OPEN | **1 × 500 + 4 × 429**，探测失败 → 重新 OPEN |
+| t=7s | HALF_OPEN | 同上，周期振荡 |
+
+三重证据：响应码（500→429）、服务日志（方法只执行 8+2 次，被拦 13 次未进方法）、Zipkin 耗时（真实请求 ~187ms 标红 vs 拦截请求 ~10ms）。
+
+三种熔断策略对比：
+
+| 策略 | 触发条件 | 场景 |
+|------|---------|------|
+| 慢调用比例 | RT > 最大 RT 的请求占比超阈值 | 下游变慢但还没报错，最灵敏的预警 |
+| 异常比例 | 异常数 / 总请求 ≥ 阈值 | 下游抛异常、500 增多 |
+| 异常数 | 窗口内异常数 ≥ 绝对次数 | 低流量接口，比例算不出来时用绝对数 |
+
+要点：
+
+- **下游不恢复，熔断器永远回不到 CLOSED**：故障接口永远报错时，系统在 OPEN ↔ HALF_OPEN 间无限振荡，是正常行为。
+- 429 响应体默认文案 `Blocked by Sentinel (flow limiting)` 是所有 `BlockException`（含熔断 `DegradeException`）的统一处理，文字写"flow limiting"但实为熔断；生产可自定义 `BlockExceptionHandler` 返回结构化提示。
+- 熔断规则同样可像 7.5 那样用 Nacos 数据源持久化（`rule-type: degrade`）。
+
 ## 八、踩坑记录
 
 - Nacos 必须 `startup.cmd -m standalone`；客户端同时连 8848(HTTP) 和 9848(gRPC)
@@ -224,3 +278,6 @@ spring:
 - 服务在 Dashboard 不出现时，可加 `-Dcsp.sentinel.heartbeat.client.ip=127.0.0.1`；Dashboard 登录会话会过期，调接口返回 401 需重新登录
 - 测流控要保证请求"同时到达且落在单个统计窗口"：业务慢（冷缓存真调 DB）会让单轮跨窗口、QPS 数据失真
 - 排队等待的「超时时间」单位是毫秒，设太小（如 10ms）会退化成快速失败；阈值也不要设太小，否则 Warm Up 爬升看不出来
+- 熔断跳闸后请求不再返回真实 500，而是 429 + `Blocked by Sentinel`；此响应 ~10ms（真实 500 ~187ms），可据此确认方法未执行
+- 故障不消除时熔断器在 OPEN ↔ HALF_OPEN 间振荡，不会自行回 CLOSED；想重置可删除并重建规则
+- Dashboard 熔断规则接口为 `/degrade/rules.json`（基础路径 `/degrade`，不是 `/v2/degrade`）
