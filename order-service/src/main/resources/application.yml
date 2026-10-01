@@ -13,6 +13,15 @@ spring:
     sentinel:
       transport:
         dashboard: 127.0.0.1:8858
+      # 规则持久化：从 Nacos 拉取流控规则，启动自动加载、发布即更新
+      datasource:
+        flow:
+          nacos:
+            server-addr: 127.0.0.1:8848
+            data-id: ${spring.application.name}-flow-rules.json
+            group-id: SENTINEL_GROUP
+            data-type: json
+            rule-type: flow
   # Redis 连接配置
   data:
     redis:

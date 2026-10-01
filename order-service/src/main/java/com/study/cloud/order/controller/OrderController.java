@@ -6,6 +6,7 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -58,6 +59,19 @@ public class OrderController {
         result.put("order", order);
         result.put("user", user);
         result.put("currentUser", currentUserName == null ? "匿名（未经过网关/未登录）" : currentUserName);
+        return result;
+    }
+
+    /**
+     * 写接口（创建订单）：仅用于演示 Sentinel「关联模式」。
+     * 当此写接口 QPS 达到阈值时，关联规则会让读接口 GET:/orders/{id} 被限流。
+     */
+    @PostMapping
+    public Map<String, Object> create() {
+        log.info("创建订单（写接口）被调用");
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("source", "order-service:8082");
         return result;
     }
 }
