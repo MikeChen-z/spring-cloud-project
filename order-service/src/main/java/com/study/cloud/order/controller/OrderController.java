@@ -84,4 +84,18 @@ public class OrderController {
         log.warn("故障接口被调用，准备抛出异常");
         throw new RuntimeException("模拟业务异常（订单服务内部故障）");
     }
+
+    /**
+     * 慢响应接口：不报错、正常返回，但耗时约 300ms。
+     * 用于演示 Sentinel「慢调用比例熔断」——下游变慢但尚未失败时提前熔断。
+     */
+    @GetMapping("/slow")
+    public Map<String, Object> slow() throws InterruptedException {
+        log.info("慢响应接口被调用，等待 300ms");
+        Thread.sleep(300);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("source", "order-service:8082");
+        return result;
+    }
 }

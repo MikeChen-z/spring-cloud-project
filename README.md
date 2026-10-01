@@ -100,6 +100,7 @@ java -jar gateway-service/target/gateway-service-1.0.0.jar
 | 4 | `GET /api/orders/{id}` | 需要 Token | 完整调用链；返回 `order`、`user`、`currentUser`（当前登录用户） |
 | 5 | `POST /api/orders` | 需要 Token | 创建订单（写接口），用于演示关联流控模式 |
 | 6 | `GET /api/orders/fail` | 需要 Token | 稳定报错接口，用于演示异常比例熔断 |
+| 7 | `GET /api/orders/slow` | 需要 Token | 慢响应接口（~300ms），用于演示慢调用比例熔断 |
 
 Postman 推荐用法：登录接口 Tests 写 `pm.environment.set("token", pm.response.json().token);` 自动存令牌，其余请求 Authorization 用 `Bearer Token = {{token}}`。
 
@@ -112,7 +113,8 @@ Postman 推荐用法：登录接口 Tests 写 `pm.environment.set("token", pm.re
 5. **熔断降级**：停掉 user-service 后请求订单接口仍返回 200，`user` 为兜底数据（`降级用户` / `fallback@example.com`）
 6. **链路追踪**：http://localhost:9411 查看 gateway → order → user 完整瀑布图、耗时与依赖拓扑
 7. **流控限流**：对订单接口瞬间打并发请求，超过 QPS 阈值的请求返回 429（详见 7.3~7.5）
-8. **异常比例熔断**：连续请求 `/orders/fail`，先见真实 500、跳闸后变 429 拦截，5 秒周期反复探测（详见 7.6）
+8. **异常比例熔断**：连续请求 `/orders/fail`，先见真实 500、跳闸后变 429 拦截，周期反复探测（详见 7.6）
+9. **慢调用比例熔断**：并发请求 `/orders/slow`，请求全部 200 成功但都 ~300ms 超阈值，照样跳闸（详见 7.7）
 
 > 测降级前先清缓存：`del orderCache::users::1`，否则缓存命中不会发出 Feign 请求，降级被缓存"掩盖"。
 
@@ -262,6 +264,37 @@ HALF_OPEN（半开，只放 1 个探测请求）
 - 429 响应体默认文案 `Blocked by Sentinel (flow limiting)` 是所有 `BlockException`（含熔断 `DegradeException`）的统一处理，文字写"flow limiting"但实为熔断；生产可自定义 `BlockExceptionHandler` 返回结构化提示。
 - 熔断规则同样可像 7.5 那样用 Nacos 数据源持久化（`rule-type: degrade`）。
 
+### 7.7 慢调用比例熔断（实测）
+
+慢调用策略关注响应**快慢**而非成败：响应 RT 超过「最大 RT」即记为一次慢调用，占比超阈值就跳闸——下游变慢但还没报错时提前止损，是最灵敏的预警型策略。
+
+**Dashboard 熔断规则**：
+
+| 字段 | 值 | 含义 |
+|------|-----|------|
+| 资源名 | `/orders/slow` | 不报错、sleep 300ms 的慢响应接口 |
+| 熔断策略 | 慢调用比例 | |
+| 最大 RT | `200` | 响应 > 200ms 记为慢调用（接口实际 ~300ms） |
+| 比例阈值 | `0.5` | 慢调用占比 ≥ 50% 跳闸 |
+| 熔断时长 / 最小请求数 / 统计时长 | 2s / 5 / 1000ms | 同 7.6 |
+
+**并发实测**（慢请求必须并发：顺序发 1 秒窗口挤不进 5 个）：
+
+| 时刻 | 状态 | 结果 | 批次耗时 |
+|------|------|------|---------|
+| t=0s | CLOSED → 跳闸 | **8 × 200**，全部成功但都慢 | 374ms |
+| t=1s | OPEN | **5 × 429**，方法 0 执行 | 41ms |
+| t=4s | HALF_OPEN | **1 × 200 + 4 × 429**，探测太慢 → 重新 OPEN | 313ms |
+| t=7s | HALF_OPEN | 同上，周期振荡 | 327ms |
+
+日志佐证：慢方法共执行 11 次（初始 1 + 8 + 探测 2），被拦 13 次未进方法。
+
+与异常比例熔断的关键差异：
+
+- **业务全部 200 成功也会跳闸**：只要 RT 超阈值、慢调用占比够高即触发，无需等报错。
+- **HALF_OPEN 探测：业务成功 ≠ 探测通过**。探测请求虽返回 200，但 RT 仍 300ms > 200ms，仍判失败、重新 OPEN；异常比例则要求探测请求抛异常才重新 OPEN。
+- 批次耗时本身可作证据：374ms（并发 sleep）→ 41ms（全拦截）→ 313ms（恰 1 个 sleep）。
+
 ## 八、踩坑记录
 
 - Nacos 必须 `startup.cmd -m standalone`；客户端同时连 8848(HTTP) 和 9848(gRPC)
@@ -281,3 +314,5 @@ HALF_OPEN（半开，只放 1 个探测请求）
 - 熔断跳闸后请求不再返回真实 500，而是 429 + `Blocked by Sentinel`；此响应 ~10ms（真实 500 ~187ms），可据此确认方法未执行
 - 故障不消除时熔断器在 OPEN ↔ HALF_OPEN 间振荡，不会自行回 CLOSED；想重置可删除并重建规则
 - Dashboard 熔断规则接口为 `/degrade/rules.json`（基础路径 `/degrade`，不是 `/v2/degrade`）
+- Windows PowerShell 5.1 的 `Invoke-WebRequest` 无 `-SkipHttpErrorCheck` 参数，并发压测改用 `System.Net.Http.HttpClient`；且需先设 `ServicePointManager.DefaultConnectionLimit=100`，否则每服务器仅 2 连接、并发不出去
+- 慢调用策略必须并发触发：单请求本身要 300ms，顺序请求 1 秒窗口最多 3 个，达不到最小请求数 5
