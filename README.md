@@ -325,7 +325,53 @@ HALF_OPEN（半开，只放 1 个探测请求）
 - **HALF_OPEN 探测：业务成功 ≠ 探测通过**。探测请求虽返回 200，但 RT 仍 300ms > 200ms，仍判失败、重新 OPEN；异常比例则要求探测请求抛异常才重新 OPEN。
 - 批次耗时本身可作证据：374ms（并发 sleep）→ 41ms（全拦截）→ 313ms（恰 1 个 sleep）。
 
-## 八、踩坑记录
+## 八、Gateway Redis 令牌桶限流
+
+与 Sentinel 互补：**Sentinel 在服务内部保护资源，网关在最外层按用户/IP 挡流量**。RequestRateLimiter 过滤器用 Redis 令牌桶，集群多实例共享同一份令牌计数。
+
+**1）依赖**（网关是 WebFlux 栈，必须用 Reactive 版 Redis 客户端）：
+
+```xml
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-data-redis-reactive</artifactId>
+</dependency>
+```
+
+**2）KeyResolver**（`RateLimitConfig.java`）：决定按什么维度计数。本例按用户：取 `Authorization` 头做 key，无令牌（如登录接口）退化为客户端 IP。
+
+**3）路由挂过滤器**（挂在 `/api/users/**`，避开 order-service 上的 Sentinel 规则干扰）：
+
+```yaml
+- id: user-service
+  uri: lb://user-service
+  predicates:
+    - Path=/api/users/**
+  filters:
+    - StripPrefix=1
+    - name: RequestRateLimiter
+      args:
+        key-resolver: "#{@userKeyResolver}"
+        redis-rate-limiter.replenishRate: 2   # 每秒补 2 个令牌
+        redis-rate-limiter.burstCapacity: 4   # 桶最多攒 4 个
+        redis-rate-limiter.requestedTokens: 1 # 每请求扣 1 个
+```
+
+**4）实测**（快速连发，令牌桶行为精确可算）：
+
+| 批次 | 请求数 | 结果 | 解读 |
+|------|--------|------|------|
+| burst A | 8 | **200×4 + 429×4** | 满桶 4 令牌：过 4 拒 4 |
+| burst B（3s 后） | 8 | **200×4 + 429×4** | 3s 补 6 个但桶上限 4，仍只过 4 |
+| burst C（再等 1s） | 4 | **200×2 + 429×2** | 1s 只补 2 个 → 过 2 拒 2 |
+
+要点：
+
+- 令牌状态存 Redis：`request_rate_limiter.{<key>}.tokens` / `.timestamp`，由 Lua 脚本原子更新（可用 `redis-cli monitor` 观察），key TTL 仅几秒、桶满即过期，属自清洁设计。
+- 网关 429 是**空响应体**，与 Sentinel 的 `Blocked by Sentinel (flow limiting)` 文案可区分限流发生在哪一层。
+- 两层限流可同时存在：网关按用户挡突发，Sentinel 按资源保服务，互不冲突。
+
+## 九、踩坑记录
 
 - Nacos 必须 `startup.cmd -m standalone`；客户端同时连 8848(HTTP) 和 9848(gRPC)
 - Gateway 是 WebFlux，**不能引入** `spring-boot-starter-web`
@@ -346,3 +392,4 @@ HALF_OPEN（半开，只放 1 个探测请求）
 - Dashboard 熔断规则接口为 `/degrade/rules.json`（基础路径 `/degrade`，不是 `/v2/degrade`）
 - Windows PowerShell 5.1 的 `Invoke-WebRequest` 无 `-SkipHttpErrorCheck` 参数，并发压测改用 `System.Net.Http.HttpClient`；且需先设 `ServicePointManager.DefaultConnectionLimit=100`，否则每服务器仅 2 连接、并发不出去
 - 慢调用策略必须并发触发：单请求本身要 300ms，顺序请求 1 秒窗口最多 3 个，达不到最小请求数 5
+- 网关限流的 Redis key 里嵌的是 Java `String.hashCode()`（KeyResolver 里算的），在 PowerShell 里用 `.GetHashCode()` 算出的值不同（.NET 哈希算法不同），查 key 时要用 MONITOR 里看到的真实 key 名
