@@ -212,6 +212,36 @@ spring:
 
 > 注意真实资源名：本项目为 `/orders/{id}` 与 `/orders`（无 `GET:`/`POST:` 前缀）；而 Feign 出站资源是 `GET:http://user-service/users/{id}`。配置前先在 Dashboard「簇点链路」核对。
 
+### 7.5.1 熔断规则持久化
+
+与流控同一套机制，在 `datasource` 下再加一个 `degrade` 数据源（`rule-type: degrade`）：
+
+```yaml
+      datasource:
+        degrade:
+          nacos:
+            server-addr: 127.0.0.1:8848
+            data-id: ${spring.application.name}-degrade-rules.json
+            group-id: SENTINEL_GROUP
+            data-type: json
+            rule-type: degrade
+```
+
+Nacos 配置：Data ID `order-service-degrade-rules.json`，Group `SENTINEL_GROUP`，内容即 7.6/7.7 实测的两条规则：
+
+```json
+[
+  { "resource": "/orders/fail", "grade": 1, "count": 0.5,
+    "timeWindow": 2, "minRequestAmount": 5, "statIntervalMs": 1000 },
+  { "resource": "/orders/slow", "grade": 0, "count": 200,
+    "slowRatioThreshold": 0.5, "timeWindow": 2, "minRequestAmount": 5, "statIntervalMs": 1000 }
+]
+```
+
+> 熔断规则字段与 Dashboard 表单对应：`grade` 0=慢调用比例 / 1=异常比例 / 2=异常数；慢调用时 `count` 是最大 RT(ms)、另需 `slowRatioThreshold`，异常策略下 `count` 是比例/次数阈值；`timeWindow` 是熔断时长（秒）。
+
+已验证：重启后两条熔断规则自动加载（Dashboard 可查），Nacos 改阈值 0.5→0.3 发布即热更新（无需重启）。
+
 ### 7.6 熔断降级规则（异常比例实测）
 
 熔断与限流互补：**限流看请求量（预防），熔断看下游健康（止损）**。熔断器是三态状态机：
@@ -262,7 +292,7 @@ HALF_OPEN（半开，只放 1 个探测请求）
 
 - **下游不恢复，熔断器永远回不到 CLOSED**：故障接口永远报错时，系统在 OPEN ↔ HALF_OPEN 间无限振荡，是正常行为。
 - 429 响应体默认文案 `Blocked by Sentinel (flow limiting)` 是所有 `BlockException`（含熔断 `DegradeException`）的统一处理，文字写"flow limiting"但实为熔断；生产可自定义 `BlockExceptionHandler` 返回结构化提示。
-- 熔断规则同样可像 7.5 那样用 Nacos 数据源持久化（`rule-type: degrade`）。
+- 熔断规则已持久化到 Nacos，见 7.5.1（重启自动加载 + 热更新均已验证）。
 
 ### 7.7 慢调用比例熔断（实测）
 

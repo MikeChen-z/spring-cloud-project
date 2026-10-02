@@ -22,6 +22,14 @@ spring:
             group-id: SENTINEL_GROUP
             data-type: json
             rule-type: flow
+        # 熔断规则同样持久化到 Nacos，rule-type 换成 degrade
+        degrade:
+          nacos:
+            server-addr: 127.0.0.1:8848
+            data-id: ${spring.application.name}-degrade-rules.json
+            group-id: SENTINEL_GROUP
+            data-type: json
+            rule-type: degrade
   # Redis 连接配置
   data:
     redis:
