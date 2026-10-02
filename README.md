@@ -371,6 +371,12 @@ HALF_OPEN（半开，只放 1 个探测请求）
 - 网关 429 是**空响应体**，与 Sentinel 的 `Blocked by Sentinel (flow limiting)` 文案可区分限流发生在哪一层。
 - 两层限流可同时存在：网关按用户挡突发，Sentinel 按资源保服务，互不冲突。
 
+**5）进阶实测（分桶隔离 + Redis 故障行为）**
+
+- 分桶隔离：用户 A 打满自己桶（200×4+429×4）后，用户 B 立即请求仍 200×4——KeyResolver 按 token hash 分桶，互不影响；
+- Redis 宕机：Lettuce 持续重连（~30s/次），期间请求挂起/超时；Redis 恢复后自动重连（日志 `Reconnected to 127.0.0.1:6379`），**限流自动恢复、无需重启网关**；
+- 生产启示：Redis 是网关限流的单点，需哨兵/集群高可用，或自定义 `RedisRateLimiter` 加本地回退。
+
 ## 九、踩坑记录
 
 - Nacos 必须 `startup.cmd -m standalone`；客户端同时连 8848(HTTP) 和 9848(gRPC)
