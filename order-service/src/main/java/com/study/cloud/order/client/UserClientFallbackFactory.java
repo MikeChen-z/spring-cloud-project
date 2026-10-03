@@ -40,6 +40,15 @@ public class UserClientFallbackFactory implements FallbackFactory<UserClient> {
                         "来自降级兜底（user-service 不可用）"
                 );
             }
+
+            /**
+             * 扣款是写操作，绝不能静默降级：必须把异常抛出去，
+             * 否则 @GlobalTransactional 感知不到分支失败，订单分支会错误提交。
+             */
+            @Override
+            public Void deduct(Long id, java.math.BigDecimal amount) {
+                throw new RuntimeException("扣款失败（user-service 不可用），全局事务必须回滚。原因：" + cause.getMessage());
+            }
         };
     }
 }

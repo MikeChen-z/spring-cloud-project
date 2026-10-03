@@ -52,6 +52,12 @@
             <artifactId>mysql-connector-j</artifactId>
         </dependency>
 
+        <!-- Seata 分布式事务（AT 模式）：作为全局事务的扣款分支，版本由 BOM 管理 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+        </dependency>
+
         <!-- JWT：登录接口签发令牌（版本由父 POM 托管） -->
         <dependency>
             <groupId>io.jsonwebtoken</groupId>

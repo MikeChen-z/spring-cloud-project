@@ -1,5 +1,6 @@
 package com.study.cloud.order;
 
+import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cache.annotation.EnableCaching;
@@ -12,10 +13,12 @@ import org.springframework.cloud.openfeign.EnableFeignClients;
  * @EnableFeignClients：扫描 @FeignClient 接口并生成代理实现，
  *                      调用方法时实际发起 HTTP 请求。
  * @EnableCaching：开启 Spring Cache，让 @Cacheable 注解生效。
+ * @MapperScan：扫描 MyBatis-Plus Mapper 接口（Seata 会自动代理其数据源）。
  */
 @EnableFeignClients
 @EnableDiscoveryClient
 @EnableCaching
+@MapperScan("com.study.cloud.order.mapper")
 @SpringBootApplication
 public class OrderServiceApplication {
 

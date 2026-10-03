@@ -5,8 +5,13 @@ import com.study.cloud.user.service.UserService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
+
+import java.math.BigDecimal;
+import java.util.Map;
 
 /**
  * 用户接口（被 order-service 通过 OpenFeign 远程调用）。
@@ -33,5 +38,16 @@ public class UserController {
         // 非数据库字段，标识来源服务
         user.setSource("user-service:8081");
         return user;
+    }
+
+    /**
+     * 扣减余额：Seata 全局事务的扣款分支（RM）。
+     * XID 由 Seata 经 HTTP 请求头自动传入，无需在此处理。
+     * 余额不足/用户不存在时抛 400，异常经 Feign 传回 order-service 触发全局回滚。
+     */
+    @PostMapping("/{id}/deduct")
+    public Map<String, Object> deduct(@PathVariable Long id, @RequestParam BigDecimal amount) {
+        userService.deduct(id, amount);
+        return Map.of("success", true, "userId", id, "deducted", amount);
     }
 }

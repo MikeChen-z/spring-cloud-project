@@ -44,6 +44,27 @@ mybatis-plus:
     map-underscore-to-camel-case: true   # t_user_name -> userName 自动驼峰映射
     log-impl: org.apache.ibatis.logging.stdout.StdOutImpl  # 学习阶段打印 SQL 到控制台
 
+# ========== Seata 分布式事务客户端 ==========
+seata:
+  application-id: ${spring.application.name}
+  # 事务分组：逻辑名称，通过下面的 vgroup-mapping 映射到 TC 集群名
+  tx-service-group: default_tx_group
+  service:
+    vgroup-mapping:
+      # key = 事务分组，value = TC 集群名（与 seata-server 端 registry.nacos.cluster 一致）
+      default_tx_group: default
+  # 从 Nacos 发现 TC（分组 SEATA_GROUP、服务名 seata-server，与服务端配置对齐）
+  registry:
+    type: nacos
+    nacos:
+      server-addr: 127.0.0.1:8848
+      namespace: ""
+      group: SEATA_GROUP
+      application: seata-server
+      cluster: default
+  # AT 模式自动代理数据源（拦截 SQL、生成 undo_log 快照），默认即为 true，显式写出便于学习
+  enable-auto-data-source-proxy: true
+
 # 学习阶段暴露所有 actuator 端点（生产环境不要这么配）
 management:
   endpoints:

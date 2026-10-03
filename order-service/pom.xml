@@ -66,6 +66,25 @@
             <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
 
+        <!-- Seata 分布式事务（AT 模式）：版本由 spring-cloud-alibaba BOM 管理，与 Seata Server 2.0.0 对应 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
+        </dependency>
+
+        <!-- MyBatis-Plus（Spring Boot 3 专用 starter）：订单库 ORM -->
+        <dependency>
+            <groupId>com.baomidou</groupId>
+            <artifactId>mybatis-plus-spring-boot3-starter</artifactId>
+            <version>3.5.5</version>
+        </dependency>
+
+        <!-- MySQL 驱动（Seata AT 要求每个分支服务有自己的数据源 + undo_log 表） -->
+        <dependency>
+            <groupId>com.mysql</groupId>
+            <artifactId>mysql-connector-j</artifactId>
+        </dependency>
+
         <!-- 链路追踪：Micrometer Tracing + Brave + Zipkin -->
         <dependency>
             <groupId>io.micrometer</groupId>

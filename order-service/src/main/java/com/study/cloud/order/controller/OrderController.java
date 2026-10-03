@@ -76,6 +76,30 @@ public class OrderController {
     }
 
     /**
+     * Seata 分布式事务演示接口：下单（写订单库 + 远程扣余额）。
+     *
+     * 直连测试：
+     * 正常：POST http://localhost:8082/orders/seata/create?userId=1&amount=100
+     * 回滚：POST
+     * http://localhost:8082/orders/seata/create?userId=1&amount=100&forceFail=true
+     */
+    @PostMapping("/seata/create")
+    public Map<String, Object> seataCreate(
+            @org.springframework.web.bind.annotation.RequestParam Long userId,
+            @org.springframework.web.bind.annotation.RequestParam(defaultValue = "Spring Cloud 学习手册") String product,
+            @org.springframework.web.bind.annotation.RequestParam java.math.BigDecimal amount,
+            @org.springframework.web.bind.annotation.RequestParam(defaultValue = "false") boolean forceFail) {
+
+        Long orderId = orderService.createOrder(userId, product, amount, forceFail);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("orderId", orderId);
+        result.put("message", "全局事务已提交（订单 + 扣款均生效）");
+        return result;
+    }
+
+    /**
      * 故障接口：每次调用稳定抛异常，用于演示 Sentinel「异常比例熔断」。
      * 资源名为 /orders/fail，熔断规则触发后该接口不再真正执行，而是直接快速失败。
      */

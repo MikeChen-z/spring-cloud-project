@@ -7,6 +7,8 @@ import com.baomidou.mybatisplus.annotation.TableName;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.Data;
 
+import java.math.BigDecimal;
+
 /**
  * 用户实体，映射 t_user 表。
  *
@@ -31,6 +33,9 @@ public class User {
      */
     @JsonIgnore
     private String password;
+
+    /** 账户余额（Seata AT 演示：下单时扣减） */
+    private BigDecimal balance;
 
     /** 标识数据来源，不入库（供下游调试看是从哪个服务返回的） */
     @TableField(exist = false)
