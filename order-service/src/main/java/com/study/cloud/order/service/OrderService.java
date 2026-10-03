@@ -1,12 +1,14 @@
 package com.study.cloud.order.service;
 
 import com.study.cloud.order.client.UserClient;
+import com.study.cloud.order.dto.OrderMessage;
 import com.study.cloud.order.dto.UserDto;
 import com.study.cloud.order.entity.Order;
 import com.study.cloud.order.mapper.OrderMapper;
 import io.seata.spring.annotation.GlobalTransactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 
@@ -25,6 +27,7 @@ public class OrderService {
 
     private final UserClient userClient;
     private final OrderMapper orderMapper;
+    private final RocketMQTemplate rocketMQTemplate;
 
     /**
      * 远程查用户，带 Redis 缓存。
@@ -78,6 +81,14 @@ public class OrderService {
             log.warn("模拟下单后异常，触发全局回滚");
             throw new RuntimeException("模拟异常：检验 Seata 全局回滚");
         }
+
+        // ========== RocketMQ：下单成功后发送积分消息 ==========
+        // 在全局事务提交后发送消息，确保消息不会在回滚时发出
+        // syncSend：同步发送，等待 Broker 确认，可靠性最高
+        OrderMessage msg = new OrderMessage(order.getId(), userId, product, amount);
+        rocketMQTemplate.syncSend("order-topic:ORDER_CREATED", msg);
+        log.info("【RocketMQ】积分消息已发送，orderId={}", order.getId());
+
         return order.getId();
     }
 }

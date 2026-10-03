@@ -2,6 +2,7 @@ package com.study.cloud.order.controller;
 
 import com.study.cloud.order.dto.UserDto;
 import com.study.cloud.order.service.OrderService;
+import com.study.cloud.order.service.OrderTxService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -9,6 +10,7 @@ import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.net.URLDecoder;
@@ -30,6 +32,7 @@ import java.util.Map;
 public class OrderController {
 
     private final OrderService orderService;
+    private final OrderTxService orderTxService;
 
     @GetMapping("/{id}")
     public Map<String, Object> getById(
@@ -120,6 +123,35 @@ public class OrderController {
         Map<String, Object> result = new LinkedHashMap<>();
         result.put("success", true);
         result.put("source", "order-service:8082");
+        return result;
+    }
+
+    /**
+     * RocketMQ 事务消息演示接口：下单（事务消息保证最终一致）。
+     *
+     * 与 /orders/seata/create 的区别：
+     * - Seata AT：强一致，本地事务 + 远程扣款同步执行，失败立即回滚
+     * - 事务消息：最终一致，本地写订单后发消息，消息确认后消费者才可见
+     *
+     * 直连测试：
+     * 正常：POST http://localhost:8082/orders/rocketmq/create?userId=1&amount=50
+     * 回查：POST
+     * http://localhost:8082/orders/rocketmq/create?userId=1&amount=50&forceUnknown=true
+     */
+    @PostMapping("/rocketmq/create")
+    public Map<String, Object> rocketmqCreate(
+            @RequestParam Long userId,
+            @RequestParam(defaultValue = "RocketMQ 事务消息演示") String product,
+            @RequestParam java.math.BigDecimal amount,
+            @RequestParam(defaultValue = "false") boolean forceUnknown) {
+
+        orderTxService.createOrderWithTxMessage(userId, product, amount, forceUnknown);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("message", forceUnknown
+                ? "半消息已发送，本地事务返回 UNKNOWN，等待 Broker 回查"
+                : "半消息已发送，本地事务已提交，消费者即将收到消息");
         return result;
     }
 }

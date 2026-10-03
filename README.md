@@ -1,7 +1,7 @@
 # Spring Cloud Study —— 微服务最小闭环学习项目
 
 以「登录 → 鉴权 → 跨服务下单」为主线，亲手打通 Spring Cloud 微服务的完整骨架：
-**注册发现、配置中心、网关鉴权、声明式调用、两级缓存、熔断降级、流控限流、链路追踪**。
+**注册发现、配置中心、网关鉴权、声明式调用、两级缓存、熔断降级、流控限流、链路追踪、分布式事务、消息队列**。
 
 ## 一、技术栈与版本
 
@@ -20,6 +20,9 @@
 | Sentinel | 1.8.8（流控/熔断，核心在依赖中） |
 | Sentinel Dashboard | 1.8.8（独立控制台，:8858，可选可视化） |
 | Micrometer Tracing + Zipkin | 全链路追踪 |
+| Seata | 2.0.0（AT 模式分布式事务，TC 端须用 JRE 8 启动） |
+| RocketMQ | 4.9.7（NameServer :9876 / Broker :10911） |
+| rocketmq-spring-boot-starter | 2.3.0（Spring Boot 3 兼容版） |
 
 ## 二、系统架构
 
@@ -36,14 +39,27 @@
         │ /api/users/**         │
         ▼                       ▼
 ┌─────────────────┐   ┌─────────────────────────┐
-│ user-service    │   │ order-service :8082     │
-│ :8081           │ ◄─│  OpenFeign（带 Sentinel  │
-│ 登录/查用户/     │   │  降级兜底）+ @Cacheable  │
-│ 配置刷新演示     │   │  Caffeine/Redis 缓存     │
-│                 │   │  Sentinel 流控（限流）   │
-└─────────────────┘   └─────────────────────────┘
+│ user-service    │◄──│ order-service :8082     │
+│ :8081           │Feign│  OpenFeign + 缓存       │
+│ 登录/查用户/     │   │  Sentinel 流控/熔断      │
+│ 扣款(RM)/加积分  │   │  @GlobalTransactional(TM)│
+│ (RocketMQ 消费)  │   │  RocketMQ 生产者/事务消息 │
+└────────┬────────┘   └───────────┬─────────────┘
+         │                        │
+         ▼                        ▼
+   study_cloud.t_user       order_db.t_order
+         └───────────┬────────────┘
+                     ▼
+        ┌─────────────────────────┐   ┌──────────────────────┐
+        │ Seata Server (TC) :8091 │   │ RocketMQ             │
+        │ 注册到 Nacos，协调两阶段 │   │ NameServer:9876      │
+        │ 提交/回滚（undo_log）    │   │ Broker:10911         │
+        └─────────────────────────┘   │ order-topic/         │
+                                      │ order-tx-topic       │
+                                      └──────────────────────┘
 
-基础设施：Nacos :8848 ｜ MySQL :3306 ｜ Redis :6379 ｜ Zipkin :9411 ｜ Sentinel Dashboard :8858
+基础设施：Nacos :8848 ｜ MySQL :3306 ｜ Redis :6379 ｜ Zipkin :9411
+          Sentinel Dashboard :8858 ｜ Seata TC :8091/:7091 ｜ RocketMQ :9876/:10911
 ```
 
 ## 三、模块说明
@@ -51,9 +67,11 @@
 | 模块 | 端口 | 职责 |
 |------|------|------|
 | `gateway-service` | 9000 | 统一入口。路由转发（`StripPrefix=1` 剥离 `/api`）、JWT 验签、白名单、用户身份头注入 |
-| `user-service` | 8081 | 登录签发 JWT、用户查询（MySQL + MyBatis-Plus）、Nacos 配置动态刷新演示 |
-| `order-service` | 8082 | 模拟订单；通过 OpenFeign 调 user-service，结果走 Caffeine/Redis 缓存，故障时 FallbackFactory 兜底；Sentinel 流控规则持久化到 Nacos |
-| `sql/init.sql` | — | 建库建表 + 初始数据 |
+| `user-service` | 8081 | 登录签发 JWT、用户查询、Nacos 配置动态刷新；Seata 扣款分支（RM）；RocketMQ 消费者（加积分） |
+| `order-service` | 8082 | OpenFeign 调 user-service + 两级缓存 + Sentinel 流控/熔断；Seata 全局事务入口（TM）；RocketMQ 生产者/事务消息 |
+| `sql/init.sql` | — | 基础库表 + 初始用户数据 |
+| `sql/seata_demo.sql` | — | order_db.t_order 建表；t_user 增加 balance 字段 |
+| `sql/rocketmq_demo.sql` | — | t_user 增加 points 字段 |
 
 ## 四、启动顺序
 
@@ -63,7 +81,12 @@
 # Nacos：必须单机模式（cluster 模式无配置会启动失败）
 startup.cmd -m standalone
 
-# MySQL：导入初始化数据
+# MySQL：按顺序导入
+#   (1) sql/init.sql              基础库表 + 用户
+#   (2) Seata Server 端 4 张表：   D:\seata\script\server\db\mysql.sql  → 独立 seata 库
+#   (3) 业务库 undo_log 快照表：    D:\seata\script\client\at\db\mysql.sql → order_db、study_cloud 各执行一次
+#   (4) sql/seata_demo.sql        t_order 表 + t_user.balance
+#   (5) sql/rocketmq_demo.sql     t_user.points
 mysql -u root -p < sql/init.sql
 
 # Redis：默认 6379 端口
@@ -73,6 +96,19 @@ java "-Dserver.port=8858" -jar sentinel-dashboard-1.8.8.jar
 
 # 可选：Zipkin 链路追踪
 java -jar zipkin-server.jar
+
+# Seata TC（必须用 JRE 8：jraft 1.3.x 与 JDK21 不兼容；-h 固定本机 IP 防多网卡误绑）
+D:\seata\start-seata-jre8.bat
+# 验证：日志见 "seata server started"，Nacos 服务列表出现 seata-server，控制台 http://localhost:7091 (seata/seata)
+
+# RocketMQ：先 NameServer 后 Broker（两个独立窗口，本机用调低内存的自定义 bat）
+D:\rocketmq\start-namesrv-jre8.bat    # 见 "The Name Server boot success"
+D:\rocketmq\start-broker-jre8.bat     # 见 "The broker[broker-a,127.0.0.1:10911] boot success"
+
+# 建 Topic（本机 autoCreateTopicEnable 偶发不生效，显式创建最稳妥）
+cd D:\rocketmq\bin
+mqadmin.cmd updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order-topic
+mqadmin.cmd updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order-tx-topic
 ```
 
 **2. 微服务（按依赖顺序）**
@@ -86,7 +122,12 @@ java -jar order-service/target/order-service-1.0.0.jar
 java -jar gateway-service/target/gateway-service-1.0.0.jar
 ```
 
-> 注意：修改 `application.yml` 后必须重新 `mvn clean package`，否则跑的还是旧配置。
+启动成功的关键日志：
+- order-service / user-service：`register TM success`、`register RM success`（Seata 连上 TC）
+- user-service：两个 `running container ... topic='order-topic' / 'order-tx-topic'`（RocketMQ 消费者就绪）
+
+> 注意：修改 `application.yml` 后必须重新 `mvn clean package`，否则跑的还是旧配置（IDEA 绿色三角直接启动除外）。
+> 改了生产者/消费者代码要重启**对应**服务：生产者在 order-service，消费者在 user-service。
 
 ## 五、接口清单（统一走网关 9000）
 
@@ -101,6 +142,11 @@ java -jar gateway-service/target/gateway-service-1.0.0.jar
 | 5 | `POST /api/orders` | 需要 Token | 创建订单（写接口），用于演示关联流控模式 |
 | 6 | `GET /api/orders/fail` | 需要 Token | 稳定报错接口，用于演示异常比例熔断 |
 | 7 | `GET /api/orders/slow` | 需要 Token | 慢响应接口（~300ms），用于演示慢调用比例熔断 |
+| 8 | `POST /api/orders/seata/create` | 直连 8082 测试 | Seata AT 下单：写订单 + 扣余额 + 发积分消息；`forceFail=true` 演示全局回滚 |
+| 9 | `POST /api/orders/rocketmq/create` | 直连 8082 测试 | RocketMQ 事务消息下单；`forceUnknown=true` 演示 Broker 事务回查 |
+
+> 接口 8/9 学习阶段直连 `http://localhost:8082` 调用（网关 JWT 不影响这两条链路）：
+> `POST http://localhost:8082/orders/seata/create?userId=1&amount=10`
 
 Postman 推荐用法：登录接口 Tests 写 `pm.environment.set("token", pm.response.json().token);` 自动存令牌，其余请求 Authorization 用 `Bearer Token = {{token}}`。
 
@@ -115,6 +161,9 @@ Postman 推荐用法：登录接口 Tests 写 `pm.environment.set("token", pm.re
 7. **流控限流**：对订单接口瞬间打并发请求，超过 QPS 阈值的请求返回 429（详见 7.3~7.5）
 8. **异常比例熔断**：连续请求 `/orders/fail`，先见真实 500、跳闸后变 429 拦截，周期反复探测（详见 7.6）
 9. **慢调用比例熔断**：并发请求 `/orders/slow`，请求全部 200 成功但都 ~300ms 超阈值，照样跳闸（详见 7.7）
+10. **Seata 正常提交**：调 `/orders/seata/create`，t_order 新增订单、t_user.balance 减少、points 增加（消息异步）
+11. **Seata 异常回滚**：加 `forceFail=true`，订单与余额改动全部回滚（undo_log 生效）；自增 ID 不回退属正常现象
+12. **RocketMQ 事务消息**：普通提交后积分增加；`forceUnknown=true` 时积分不变，约 50~60s 后 Broker 回查返回 COMMIT，积分才增加（详见第十章）
 
 > 测降级前先清缓存：`del orderCache::users::1`，否则缓存命中不会发出 Feign 请求，降级被缓存"掩盖"。
 
@@ -377,7 +426,154 @@ HALF_OPEN（半开，只放 1 个探测请求）
 - Redis 宕机：Lettuce 持续重连（~30s/次），期间请求挂起/超时；Redis 恢复后自动重连（日志 `Reconnected to 127.0.0.1:6379`），**限流自动恢复、无需重启网关**；
 - 生产启示：Redis 是网关限流的单点，需哨兵/集群高可用，或自定义 `RedisRateLimiter` 加本地回退。
 
-## 九、踩坑记录
+## 九、Seata AT 分布式事务
+
+跨库跨服务下单：order-service 写 `order_db.t_order`，同时 Feign 调 user-service 扣 `study_cloud.t_user.balance`。任一步失败，两个库的数据必须一起回滚。
+
+### 9.1 三个角色
+
+| 角色 | 是谁 | 职责 |
+|------|------|------|
+| **TC**（事务协调器） | Seata Server :8091，独立进程 | 维护全局事务/分支事务状态，驱动二阶段提交或回滚，状态存 MySQL（seata 库 4 张表） |
+| **TM**（事务管理器） | order-service（标 `@GlobalTransactional` 的方法） | 开启/提交/回滚全局事务，拿到全局 XID |
+| **RM**（资源管理器） | 每个写库的服务（order-service + user-service） | 向 TC 注册分支、上报本地事务状态、执行回滚 |
+
+TM 与 RM 之间没有层级调用关系，它们都只与 TC 通信（Netty TCP 长连接）。XID 随 Feign 请求头（`TX_XID`/`X-TX-XID`）自动透传，把多个服务绑进同一个全局事务。
+
+### 9.2 服务端（TC）
+
+- 版本 **2.0.0**，注册中心/配置用 `conf/application.yml`（config 用 file、registry 用 nacos、store 用 db）
+- 独立 `seata` 库存 4 张表：`global_table`、`branch_table`、`lock_table`、`distributed_lock`（脚本 `script/server/db/mysql.sql`），**禁止混入业务库**
+- **必须 JRE 8 启动**：jraft-core 1.3.13 与 JDK 21 不兼容；学习机把堆调到 `-Xmx256m`（默认 2G + 1G 直接内存会挤爆）
+- 启动带 `-h 127.0.0.1`：多网卡机器防止绑定/注册到虚拟网卡 IP
+
+### 9.3 客户端（业务服务）
+
+1. 依赖：`spring-cloud-starter-alibaba-seata`
+2. 每个业务库建 `undo_log` 表（`script/client/at/db/mysql.sql`）——回滚快照
+3. `application.yml`：
+
+```yaml
+seata:
+  tx-service-group: default_tx_group        # 事务分组
+  service:
+    vgroup-mapping:
+      default_tx_group: default             # 分组 → TC 集群名
+  registry:                                  # 从 Nacos 找 TC
+    type: nacos
+    nacos: { server-addr: 127.0.0.1:8848, group: SEATA_GROUP, application: seata-server, cluster: default }
+  enable-auto-data-source-proxy: true        # 自动代理数据源，拦截 SQL 生成快照
+```
+
+4. 入口方法一个注解：`@GlobalTransactional(rollbackFor = Exception.class)`，本地分支照常写 `@Transactional`/直接 Mapper。
+
+### 9.4 AT 两阶段机制
+
+- **一阶段（业务执行时）**：拦截 SQL，查前镜像 → 执行业务 SQL 并**本地提交** → 查后镜像，连同全局锁信息写入 `undo_log`。锁的是"逻辑行"（主键），不是数据库行锁，不长期占连接。
+- **二阶段提交**：各分支都成功 → TC 异步删除各库 `undo_log`（极快，无反向补偿）。
+- **二阶段回滚**：任一分支失败 → RM 按 `undo_log` 前镜像生成反向 SQL 自动补偿（INSERT↔DELETE、UPDATE 反向更新），并校验后镜像防止脏写。
+
+### 9.5 实测
+
+| 用例 | 请求 | t_order | balance |
+|------|------|---------|---------|
+| 正常提交 | `POST /orders/seata/create?userId=1&amount=100` | 新增 1 条 | 1000 → 900 |
+| 强制失败 | 同上加 `forceFail=true` | 插入后**回滚消失** | 扣款后**恢复** |
+
+启动成功的判据：日志 `register TM success` + `register RM success`。注意 **AT 回滚不重置自增 ID**（被回滚的订单号会"跳号"），这是数据库机制，正常现象。
+
+### 9.6 AT 的边界（重要）
+
+undo_log 只代理受管数据源的 SQL。以下操作 AT **管不到**，需用 TCC/Saga 或事务消息兜底：
+
+- 发 MQ、写 Redis、调第三方 HTTP
+- 手动拿到原生连接执行的 SQL、跨非关系型存储
+
+所以下一章的 RocketMQ 消息放在**全局事务方法返回之后**发送，避免"事务回滚了消息却发出去"。
+
+## 十、RocketMQ 消息队列
+
+解决两类问题：**异步解耦**（下单后加积分/通知，不等下游）与**最终一致**（本地事务与发消息的原子性）。
+
+### 10.1 架构与端口
+
+| 组件 | 端口 | 职责 |
+|------|------|------|
+| NameServer | 9876 | 无状态路由中心：Broker 注册，Producer/Consumer 查路由 |
+| Broker | 10911（10909 VIP） | 存消息、管 Topic 队列、事务状态 |
+| Producer | order-service | `rocketMQTemplate.syncSend(...)` / `sendMessageInTransaction(...)` |
+| Consumer | user-service | `@RocketMQMessageListener` 两个监听器 |
+
+本机版本：Broker **4.9.7** + rocketmq-spring-boot-starter **2.3.0**。
+
+### 10.2 场景一：普通消息异步加积分（Seata + MQ 组合）
+
+链路：`@GlobalTransactional` 下单（写订单 + 扣余额）成功**返回后** → `syncSend("order-topic:ORDER_CREATED", msg)` → user-service 的 `OrderPointsConsumer` 消费 → `points += 金额`。
+
+- Topic `order-topic`，Tag `ORDER_CREATED`，消费组 `user-service-points-consumer-group`
+- `syncSend` 同步等 Broker ACK，失败会按 `retry-times-when-send-failed` 重试
+- **幂等**：消息可能重复投递（网络重试/Broker 重启），消费端必须可重复执行；学习版直接累加，生产应用"积分流水表"按 orderId 去重
+- 实测：amount=10 → balance 740→730，points 0→10（约几十毫秒后可见）
+
+### 10.3 场景二：事务消息（半消息 + 回查）
+
+"写订单"和"发消息"两步不能出现中间态：订单写成功但消息丢了 → 用户永远拿不到积分；消息先发出去但订单回滚 → 凭空发积分。RocketMQ 事务消息用**两阶段 + 回查**解决：
+
+```
+Producer                    Broker                     Consumer
+   │  1.发半消息(half)         │                            │
+   │ ────────────────────────▶│ 暂存，对消费者不可见         │
+   │  2.执行本地事务            │                            │
+   │    （insert t_order）      │                            │
+   │  3.返回 COMMIT/ROLLBACK/UNKNOWN                         │
+   │ ────────────────────────▶│                            │
+   │        COMMIT             │ 4.消息变可见 ─────────────▶│ 消费加积分
+   │        ROLLBACK           │ 直接丢弃，无人可见           │
+   │        UNKNOWN            │ 5.定时回查 Producer          │
+   │ ◀──── checkLocalTransaction ────                       │
+   │ 查业务记录 → COMMIT/ROLLBACK                            │
+```
+
+代码对应：`OrderTxService.createOrderWithTxMessage` 发半消息，`OrderTransactionListener` 实现两个回调：
+- `executeLocalTransaction`：执行 insert，成功返 `COMMIT`、异常返 `ROLLBACK`、不确定返 `UNKNOWN`
+- `checkLocalTransaction`：Broker 回查时查业务状态（学习版固定 COMMIT，生产按业务流水号查表）
+
+> 常量名坑：starter 2.3.0 是 `RocketMQLocalTransactionState.COMMIT / ROLLBACK / UNKNOWN`，**不是** 旧资料里的 `COMMIT_MESSAGE / ROLLBACK_MESSAGE`。
+
+**回查实测定时证据**（`forceUnknown=true`，amount=5）：
+
+| 时刻 | 事件 | points |
+|------|------|--------|
+| 18:34:28 | 半消息发出，本地 insert 成功但返回 UNKNOWN | 30（不变） |
+| 8s 后查询 | 消息仍不可见，消费端毫无动静 | 30 |
+| **18:35:18**（约 50s 后） | Broker 第 1 次回查（日志 `TRANSACTION_CHECK_TIMES=1`）→ COMMIT | 30 → **35** |
+
+### 10.4 两种一致性方案怎么选
+
+| | Seata AT（第九章） | RocketMQ 事务消息 |
+|---|---|---|
+| 一致性 | 强一致（二阶段自动补偿） | 最终一致（秒级延迟） |
+| 适用 | 同构数据库、短事务、要求立即一致 | 跨异构系统、异步链路、可容忍延迟 |
+| 代价 | undo_log、全局锁、TC 独立组件 | Broker 半消息存储与定时回查 |
+| 典型 | 下单 + 扣余额 + 扣库存 | 下单 → 积分/通知/物流，与第三方系统对接 |
+
+本项目把两者组合：**库内强一致交给 Seata，库外异步解耦交给 RocketMQ**。
+
+### 10.5 Windows 本机部署要点
+
+1. 启动两个独立窗口：先 NameServer（`start-namesrv-jre8.bat`）后 Broker（`start-broker-jre8.bat`）
+2. 学习机必须调小 JVM：NameServer 256m、Broker 堆 512m + 直接内存 512m（默认 2G+15G）
+3. `conf/broker.conf` 固定 `brokerIP1=127.0.0.1`，否则 Broker 注册到 VMware/WSL 虚拟网卡 IP
+4. Topic 显式创建最稳妥（`autoCreateTopicEnable=true` 本机偶发不生效，消费者会订阅报 `topic not exist`）：
+
+```bash
+set ROCKETMQ_HOME=D:\rocketmq
+mqadmin.cmd updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order-topic
+mqadmin.cmd updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order-tx-topic
+# 看消费进度/积压：mqadmin.cmd consumerProgress -n 127.0.0.1:9876 -g <消费组名>
+```
+
+## 十一、踩坑记录
 
 - Nacos 必须 `startup.cmd -m standalone`；客户端同时连 8848(HTTP) 和 9848(gRPC)
 - Gateway 是 WebFlux，**不能引入** `spring-boot-starter-web`
@@ -399,3 +595,25 @@ HALF_OPEN（半开，只放 1 个探测请求）
 - Windows PowerShell 5.1 的 `Invoke-WebRequest` 无 `-SkipHttpErrorCheck` 参数，并发压测改用 `System.Net.Http.HttpClient`；且需先设 `ServicePointManager.DefaultConnectionLimit=100`，否则每服务器仅 2 连接、并发不出去
 - 慢调用策略必须并发触发：单请求本身要 300ms，顺序请求 1 秒窗口最多 3 个，达不到最小请求数 5
 - 网关限流的 Redis key 里嵌的是 Java `String.hashCode()`（KeyResolver 里算的），在 PowerShell 里用 `.GetHashCode()` 算出的值不同（.NET 哈希算法不同），查 key 时要用 MONITOR 里看到的真实 key 名
+
+**Seata**
+
+- Seata Server 2.0.0 必须用 **JRE 8** 启动：jraft-core 1.3.13 在 JDK 21 下直接异常；MySQL 驱动要 8.x 并显式写 `driver-class-name: com.mysql.cj.jdbc.Driver`
+- TC 端 4 张表必须在独立 `seata` 库；每个业务库（order_db、study_cloud）各建一张 `undo_log`，缺表回滚时才报错
+- `store.db` 的表名拼写敏感：`global_table`、`distributed_lock` 等拼错（如 `glable_table`）不会启动失败，而是静默不可用
+- 多网卡环境启动加 `-h 127.0.0.1`；但要分清"虚拟网卡 IP"和"真实 WLAN IP"——Seata 通常已自动跳过 VMware 网卡，注册的是当前物理网卡 IP，**本机连该 IP 本就可达**。排查连接问题先按「进程在不在 → 端口监听没 → TCP 连不连得通」顺序验证，不要一上来就怀疑注册 IP
+- 内存吃紧时（本机 16G 跑全套组件）Seata 会启动后闪退且无明显报错，把 `-Xmx/-Xms` 降到 256m；`netstat` 短暂看到监听不等于进程活着
+- 客户端报 `No available service`：九成是 TC 没起来或注册 IP 过期（换 WiFi/地点后 Nacos 缓存旧 IP），重启 TC 等 10~15s 心跳刷新即可
+- AT 回滚不会回退自增主键（被回滚的订单 id 照样跳号）；MQ/Redis/HTTP 调用不在 AT 保护范围内
+
+**RocketMQ**
+
+- Windows 自写 `.bat`/`.cmd` 用**纯英文 ASCII**（或 GBK 编码保存），UTF-8 中文注释会让 cmd 解析乱码、双击闪退
+- 默认 JVM 极大（Broker `-Xms2g -Xmx2g -XX:MaxDirectMemorySize=15g`），学习机改 `runserver.cmd`/`runbroker.cmd` 调小
+- Broker 多网卡要配 `brokerIP1=127.0.0.1`；改完 Broker 配置必须**重启 Broker**
+- Topic 不存在时生产者不报错、消费者订阅刷 `topic not exist`；`autoCreateTopicEnable=true` 不可靠，用 `mqadmin updateTopic` 显式建
+- `mqadmin.cmd` 依赖 `ROCKETMQ_HOME` 环境变量，新窗口先 `set ROCKETMQ_HOME=D:\rocketmq`
+- rocketmq-spring 2.3.0 事务状态常量是 `COMMIT/ROLLBACK/UNKNOWN`，旧教程的 `COMMIT_MESSAGE/ROLLBACK_MESSAGE` 编译不过
+- 生产者代码在 order-service、消费者在 user-service，改完**两边都要重新打包重启**；只重启一边是最常见的"消息没反应"原因
+- 排查消息链路三板斧：`mqadmin topicList` 看 Topic、`consumerProgress -g <组>` 看消费偏移/积压、`%USERPROFILE%\logs\rocketmqlogs\rocketmq_client.log` 看客户端注册与订阅报错
+- 事务消息 UNKNOWN 后不要傻等：Broker 默认约 60s 才首次回查（`transactionCheckInterval`），回查日志在生产者端（order-service），不在 Broker 控制台

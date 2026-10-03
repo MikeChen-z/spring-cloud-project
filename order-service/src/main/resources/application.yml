@@ -59,6 +59,18 @@ feign:
   sentinel:
     enabled: true
 
+# ========== RocketMQ 消息队列 ==========
+rocketmq:
+  # NameServer 地址（服务发现，Broker 注册到这里）
+  name-server: 127.0.0.1:9876
+  producer:
+    # 生产者组名（同一组内消息负载均衡）
+    group: order-service-producer-group
+    # 发送超时时间（ms）
+    send-message-timeout: 3000
+    # 失败重试次数（同步发送时生效）
+    retry-times-when-send-failed: 2
+
 # MyBatis-Plus
 mybatis-plus:
   configuration:

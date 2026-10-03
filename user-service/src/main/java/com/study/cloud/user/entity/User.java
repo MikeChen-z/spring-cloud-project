@@ -37,6 +37,9 @@ public class User {
     /** 账户余额（Seata AT 演示：下单时扣减） */
     private BigDecimal balance;
 
+    /** 用户积分（RocketMQ 演示：消费订单消息累加） */
+    private Integer points;
+
     /** 标识数据来源，不入库（供下游调试看是从哪个服务返回的） */
     @TableField(exist = false)
     private String source;

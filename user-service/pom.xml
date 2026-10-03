@@ -58,6 +58,12 @@
             <artifactId>spring-cloud-starter-alibaba-seata</artifactId>
         </dependency>
 
+        <!-- RocketMQ：消息消费者（监听订单消息加积分） -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-spring-boot-starter</artifactId>
+        </dependency>
+
         <!-- JWT：登录接口签发令牌（版本由父 POM 托管） -->
         <dependency>
             <groupId>io.jsonwebtoken</groupId>

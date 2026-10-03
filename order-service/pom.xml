@@ -85,6 +85,12 @@
             <artifactId>mysql-connector-j</artifactId>
         </dependency>
 
+        <!-- RocketMQ：消息生产者（下单后发消息） -->
+        <dependency>
+            <groupId>org.apache.rocketmq</groupId>
+            <artifactId>rocketmq-spring-boot-starter</artifactId>
+        </dependency>
+
         <!-- 链路追踪：Micrometer Tracing + Brave + Zipkin -->
         <dependency>
             <groupId>io.micrometer</groupId>

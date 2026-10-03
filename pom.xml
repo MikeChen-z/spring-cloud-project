@@ -27,6 +27,8 @@
         <spring-cloud-alibaba.version>2023.0.1.0</spring-cloud-alibaba.version>
         <!-- JJWT：登录签发与网关验签共用同一版本，保证契约一致 -->
         <jjwt.version>0.12.6</jjwt.version>
+        <!-- RocketMQ Spring Boot Starter：与 RocketMQ 4.9.x 服务端兼容 -->
+        <rocketmq.version>2.3.0</rocketmq.version>
     </properties>
 
     <modules>
@@ -77,6 +79,12 @@
                 <groupId>io.jsonwebtoken</groupId>
                 <artifactId>jjwt-jackson</artifactId>
                 <version>${jjwt.version}</version>
+            </dependency>
+            <!-- RocketMQ Spring Boot Starter -->
+            <dependency>
+                <groupId>org.apache.rocketmq</groupId>
+                <artifactId>rocketmq-spring-boot-starter</artifactId>
+                <version>${rocketmq.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>
