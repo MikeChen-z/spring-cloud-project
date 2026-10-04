@@ -508,12 +508,12 @@ undo_log 只代理受管数据源的 SQL。以下操作 AT **管不到**，需�
 
 ### 10.2 场景一：普通消息异步加积分（Seata + MQ 组合）
 
-链路：`@GlobalTransactional` 下单（写订单 + 扣余额）成功**返回后** → `syncSend("order-topic:ORDER_CREATED", msg)` → user-service 的 `OrderPointsConsumer` 消费 → `points += 金额`。
+链路：`@GlobalTransactional` 下单（写订单 + 扣余额）**本地事务提交后** → afterCommit 回调中 `syncSend("order-topic:ORDER_CREATED", msg)` → user-service 的 `OrderPointsConsumer` 消费 → 先写积分流水占坑，再 `points += 金额`。
 
 - Topic `order-topic`，Tag `ORDER_CREATED`，消费组 `user-service-points-consumer-group`
-- `syncSend` 同步等 Broker ACK，失败会按 `retry-times-when-send-failed` 重试
-- **幂等**：消息可能重复投递（网络重试/Broker 重启），消费端必须可重复执行；学习版直接累加，生产应用"积分流水表"按 orderId 去重
-- 实测：amount=10 → balance 740→730，points 0→10（约几十毫秒后可见）
+- `syncSend` 同步等 Broker ACK（只等 Broker 收下，**不等消费者执行**），失败按 `retry-times-when-send-failed` 重试
+- **消息可靠性双保险**：发送侧 afterCommit + 消费侧幂等流水，详见 10.6
+- 实测：amount=1 → balance 725→724，points 41→42（提交后约几十毫秒可见）
 
 ### 10.3 场景二：事务消息（半消息 + 回查）
 
@@ -573,6 +573,64 @@ mqadmin.cmd updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order-tx-topic
 # 看消费进度/积压：mqadmin.cmd consumerProgress -n 127.0.0.1:9876 -g <消费组名>
 ```
 
+### 10.6 消息可靠性：发送时机 + 消费幂等 + 死信
+
+MQ 语义是**至少一次**（不丢，但可能重复）。项目用"发送侧 + 消费侧"两道防线把它收敛成业务视角的精确一次：
+
+**① 发送侧：事务提交后才发（afterCommit）**
+
+不能在 `@GlobalTransactional` 方法体里直接 `syncSend`——方法返回 ≠ 全局事务已提交，存在"消息发出、事务回滚 → 凭空加积分"的窗口。正确做法：
+
+```java
+@GlobalTransactional(rollbackFor = Exception.class)
+@Transactional(rollbackFor = Exception.class)   // 必须有本地事务才能注册回调
+public Long createOrder(...) {
+    // ...写订单、扣款...
+    OrderMessage msg = new OrderMessage(order.getId(), "ORDER-" + order.getId(), ...);
+    TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+        @Override public void afterCommit() {           // 回滚时此回调不执行
+            rocketMQTemplate.syncSend("order-topic:ORDER_CREATED", msg);
+        }
+    });
+    return order.getId();
+}
+```
+
+实测日志时序：分支1/2 → **事务提交后发送** → Seata RM 分支提交。`forceFail=true` 时：500、订单与扣款回滚、afterCommit 不触发、无消息无流水。
+
+> 注意：`@GlobalTransactional` 本身不是 Spring 本地事务，单独存在时 `TransactionSynchronizationManager.isSynchronizationActive()` 为 false，注册不了回调，必须叠加 `@Transactional`。代价是 Feign 调用期间连接被占用，生产可用本地消息表替代。
+
+**② 消费侧：唯一索引流水表幂等**
+
+`t_points_log.biz_no` 唯一索引，消费时**先插流水（占坑）再加积分**，两步同一本地事务：
+
+```
+INSERT 流水成功 → 首次消息 → 加积分
+DuplicateKeyException → 重复投递 → return（ACK 跳过），绝不重复加积分
+```
+
+- bizNo 生成：普通消息 `ORDER-{orderId}`；事务消息发半消息前预生成 UUID（此时订单未插入、orderId 为 null）
+- 幂等键随消息体流动，Broker 重投/rebalance/消费者重启都能识别"同一条"
+- 唯一索引优于"先 select 后 insert"：后者并发下有竞态，数据库约束才是最终兜底
+- 插流水与加分同事务：加分失败一起回滚，重投时可重新处理（不会被误判为重复）
+
+实测四组：首次消费加积分写流水 / 预埋流水模拟重复（积分不动、日志 `【幂等拦截】`）/ 后续正常消息不受影响 / 事务消息 UUID 流水。
+
+> 与 Redis Token 幂等的区别：Token 防的是**入口处客户端重复提交**（先领票、一票一销），无法用于 MQ（Broker 重投没有领票环节）；两者在生产中分层共存。
+
+**③ 兜底：重试 16 次 → 死信队列 `%DLQ%<消费组>`**
+
+消费持续失败（毒消息）时消息进死信 Topic 隔离，不再自动投递，靠监控告警 + 人工/程序补偿；重试 Topic 为 `%RETRY%<消费组>`。消息从生产到终局：
+
+```
+afterCommit 发送（不回滚的消息才出门）
+  → Broker 存储投递
+  → 消费成功 ACK
+  → 失败递增重试（10s…2h，共 16 次）
+  → 仍失败 → %DLQ% 死信隔离，等待人工补偿
+消费全程：bizNo 唯一索引保证重复投递只生效一次
+```
+
 ## 十一、踩坑记录
 
 - Nacos 必须 `startup.cmd -m standalone`；客户端同时连 8848(HTTP) 和 9848(gRPC)
@@ -617,3 +675,6 @@ mqadmin.cmd updateTopic -n 127.0.0.1:9876 -c DefaultCluster -t order-tx-topic
 - 生产者代码在 order-service、消费者在 user-service，改完**两边都要重新打包重启**；只重启一边是最常见的"消息没反应"原因
 - 排查消息链路三板斧：`mqadmin topicList` 看 Topic、`consumerProgress -g <组>` 看消费偏移/积压、`%USERPROFILE%\logs\rocketmqlogs\rocketmq_client.log` 看客户端注册与订阅报错
 - 事务消息 UNKNOWN 后不要傻等：Broker 默认约 60s 才首次回查（`transactionCheckInterval`），回查日志在生产者端（order-service），不在 Broker 控制台
+- MQ 消费必须做幂等：唯一索引 INSERT 冲突即重复消息，正常 return 即 ACK；注意冲突失败的 INSERT 也会烧掉一个自增 ID（流水表 id 出现"空洞"是正常现象）
+- afterCommit 回调前提是方法上有活跃的 Spring 事务（`@Transactional`）；只有 `@GlobalTransactional` 时注册回调不生效
+- 消费端"用户不存在"这类坏消息要抛异常让其重试，不能 return 当成功 ACK，否则消息被当成已消费永久丢失

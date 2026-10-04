@@ -11,6 +11,9 @@ import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
+import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.support.TransactionSynchronization;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 import java.math.BigDecimal;
 
@@ -59,9 +62,17 @@ public class OrderService {
      * - 方法抛出任何异常 → TC 通知两个分支按 undo_log 一起回滚
      * 即使订单 INSERT 已执行、余额已扣，物理数据也会恢复原状
      *
+     * @Transactional：开启本服务的 Spring 本地事务。
+     *                       注意 @GlobalTransactional 本身不是 Spring 事务，没有它就无法注册
+     *                       TransactionSynchronization（afterCommit 回调依赖活跃的 Spring
+     *                       事务）。
+     *                       代价：Feign 调用期间本地事务保持打开、连接被占用，学习项目可接受；
+     *                       生产中可把远程调用移出事务边界或用本地消息表。
+     *
      * @param forceFail true 时在扣款成功后人为抛异常，用于观察两个库同时回滚
      */
     @GlobalTransactional(name = "create-order", rollbackFor = Exception.class)
+    @Transactional(rollbackFor = Exception.class)
     public Long createOrder(Long userId, String product, BigDecimal amount, boolean forceFail) {
         // 分支 1：本地写订单
         Order order = new Order();
@@ -78,16 +89,22 @@ public class OrderService {
 
         if (forceFail) {
             // 此时两分支都已执行完 SQL，抛异常后应看到：订单消失、余额恢复
+            // afterCommit 不会执行 → 积分消息永远不会发出
             log.warn("模拟下单后异常，触发全局回滚");
             throw new RuntimeException("模拟异常：检验 Seata 全局回滚");
         }
 
-        // ========== RocketMQ：下单成功后发送积分消息 ==========
-        // 在全局事务提交后发送消息，确保消息不会在回滚时发出
-        // syncSend：同步发送，等待 Broker 确认，可靠性最高
-        OrderMessage msg = new OrderMessage(order.getId(), userId, product, amount);
-        rocketMQTemplate.syncSend("order-topic:ORDER_CREATED", msg);
-        log.info("【RocketMQ】积分消息已发送，orderId={}", order.getId());
+        // ========== RocketMQ：注册"事务提交后"回调再发积分消息 ==========
+        // 不在这里直接 syncSend——此刻全局事务尚未最终提交，存在"消息已发、事务回滚"的窗口。
+        // afterCommit 在本地事务提交成功后才执行：回滚时该回调不会触发，消息不会发出。
+        OrderMessage msg = new OrderMessage(order.getId(), "ORDER-" + order.getId(), userId, product, amount);
+        TransactionSynchronizationManager.registerSynchronization(new TransactionSynchronization() {
+            @Override
+            public void afterCommit() {
+                rocketMQTemplate.syncSend("order-topic:ORDER_CREATED", msg);
+                log.info("【RocketMQ】事务提交后发送积分消息，orderId={}", order.getId());
+            }
+        });
 
         return order.getId();
     }

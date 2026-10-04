@@ -47,7 +47,10 @@ public class OrderTxService {
         order.setAmount(amount);
         order.setStatus(0);
 
-        OrderMessage message = new OrderMessage(null, userId, product, amount);
+        // 发半消息前预生成幂等键（此时订单尚未插入、orderId 不存在）：
+        // 同一条事务消息无论 Broker 重投多少次，bizNo 始终是这个 UUID，消费端靠它去重
+        String bizNo = java.util.UUID.randomUUID().toString().replace("-", "");
+        OrderMessage message = new OrderMessage(null, bizNo, userId, product, amount);
 
         // sendMessageInTransaction：
         // 1. 先发半消息到 Broker（此时消费者不可见）
