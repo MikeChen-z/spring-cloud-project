@@ -1,0 +1,52 @@
+# Seata Server 容器版配置（基于 D:\seata\conf\application.yml 改造）
+# 改动点：127.0.0.1 -> 容器服务名（nacos / mysql），同一 study-net 网络内可用
+server:
+  port: 7091
+
+spring:
+  application:
+    name: seata-server
+
+logging:
+  config: classpath:logback-spring.xml
+  file:
+    path: ${log.home:${user.home}/logs/seata}
+
+console:
+  user:
+    username: seata
+    password: seata
+
+seata:
+  config:
+    type: file
+  registry:
+    type: nacos
+    nacos:
+      application: seata-server
+      server-addr: nacos:8848          # 容器服务名，替代 127.0.0.1
+      namespace: ""
+      group: SEATA_GROUP
+      cluster: default
+  store:
+    mode: db
+    db:
+      db-type: mysql
+      driver-class-name: com.mysql.cj.jdbc.Driver
+      datasource: druid
+      url: jdbc:mysql://mysql:3306/seata?rewriteBatchedStatements=true&useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=Asia/Shanghai   # 容器服务名 mysql + 公钥检索允许（MySQL8 caching_sha2_password）
+      user: root
+      password: "123456"
+      min-conn: 5
+      max-conn: 100
+      global-table: global_table
+      branch-table: branch_table
+      lock-table: lock_table
+      distributed-lock-table: distributed_lock
+      query-limit: 1000
+      max-wait: 5000
+  security:
+    secretKey: SeataSecretKey0c382ef121d778043159209298fd40bf3850a017
+    tokenValidityInMilliseconds: 1800000
+    ignore:
+      urls: /,/**/*.css,/**/*.js,/**/*.html,/**/*.map,/**/*.svg,/**/*.png,/**/*.jpeg,/**/*.ico,/api/v1/auth/login,/metadata/v1/**

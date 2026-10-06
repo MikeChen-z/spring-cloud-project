@@ -678,3 +678,184 @@ afterCommit 发送（不回滚的消息才出门）
 - MQ 消费必须做幂等：唯一索引 INSERT 冲突即重复消息，正常 return 即 ACK；注意冲突失败的 INSERT 也会烧掉一个自增 ID（流水表 id 出现"空洞"是正常现象）
 - afterCommit 回调前提是方法上有活跃的 Spring 事务（`@Transactional`）；只有 `@GlobalTransactional` 时注册回调不生效
 - 消费端"用户不存在"这类坏消息要抛异常让其重试，不能 return 当成功 ACK，否则消息被当成已消费永久丢失
+
+## 十二、Docker Compose 容器化编排
+
+从"9 个黑窗口手动启动"进化到 `docker compose up -d` 一键拉起全套环境。
+
+### 12.1 服务清单
+
+10 个服务全部跑在 `study-net` 自定义桥接网络内，通过**服务名**互相访问。
+
+| 服务 | 镜像 | 端口 | 数据卷 | 说明 |
+|------|------|------|--------|------|
+| mysql | mysql:8.0 | 3306 | mysql-data | 3 个业务库：study_cloud / order_db / seata |
+| redis | redis:7.4 | 6379 | redis-data | 缓存 + 网关限流 |
+| nacos | nacos/nacos-server:v2.4.0 | 8848, 9848 | nacos-data | 注册中心 + 配置中心（单机） |
+| namesrv | apache/rocketmq:4.9.7 | 9876 | - | RocketMQ 路由中心 |
+| broker | apache/rocketmq:4.9.7 | 10911, 10909 | rocketmq-store, rocketmq-logs | 消息存储中转 |
+| seata | seataio/seata-server:2.0.0 | 8091, 7091 | -（挂载 application.yml） | 分布式事务 TC |
+| zipkin | openzipkin/zipkin:3 | 9411 | - | 链路追踪（可选） |
+| user-service | user-service:1.0.0 | 8081 | - | 用户服务 |
+| order-service | order-service:1.0.0 | 8082 | - | 订单服务 |
+| gateway-service | gateway-service:1.0.0 | 9000 | - | 网关 |
+
+### 12.2 一键启动
+
+```powershell
+# 构建微服务镜像（首次或代码改动后）
+docker build -t user-service:1.0.0 ./user-service
+docker build -t order-service:1.0.0 ./order-service
+docker build -t gateway-service:1.0.0 ./gateway-service
+
+# 启动全部
+docker compose up -d
+
+# 查看状态
+docker compose ps
+
+# 看日志
+docker compose logs -f order-service
+
+# 停止
+docker compose down          # 只删容器，保留数据卷
+docker compose down -v       # 连数据卷一起删（慎用！数据全清）
+```
+
+### 12.3 Dockerfile 设计（微服务通用模板）
+
+```dockerfile
+FROM eclipse-temurin:17-jre      # 只用 JRE，不用 JDK，镜像更小
+WORKDIR /app
+COPY target/user-service-1.0.0.jar app.jar
+EXPOSE 8081
+ENV TZ=Asia/Shanghai
+ENTRYPOINT ["java", "-Xms256m", "-Xmx512m", "-jar", "app.jar"]
+```
+
+### 12.4 配置外部化：一份配置跑两种环境
+
+`application.yml` 里所有 `127.0.0.1` 改成 `${ENV:default}` 占位符：
+
+```yaml
+spring:
+  cloud:
+    nacos:
+      discovery:
+        server-addr: ${NACOS_ADDR:127.0.0.1:8848}
+  datasource:
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:3306/study_cloud?...
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+rocketmq:
+  name-server: ${NAMESRV_ADDR:127.0.0.1:9876}
+management:
+  zipkin:
+    tracing:
+      endpoint: http://${ZIPKIN_HOST:127.0.0.1}:9411/api/v2/spans
+```
+
+- **IDEA 本地跑**：不传环境变量 → 用默认值 `127.0.0.1`
+- **容器跑**：compose 里传服务名 → `NACOS_ADDR=nacos:8848`
+
+### 12.5 数据初始化（首次启动必做）
+
+Compose 创建的是**全新数据卷**（带项目名前缀 `spring-cloud-study_`），MySQL/Nacos 都是空的，需要导入备份。
+
+**MySQL 三个库**：
+
+```powershell
+Get-Content docker/backup/order_db.sql     | docker exec -i mysql mysql -uroot -p123456
+Get-Content docker/backup/study_cloud.sql  | docker exec -i mysql mysql -uroot -p123456
+Get-Content docker/backup/seata.sql        | docker exec -i mysql mysql -uroot -p123456
+```
+
+**Nacos 配置**（通过 OpenAPI 导入）：
+
+```powershell
+# user-service 配置
+curl.exe -s -X POST "http://localhost:8848/nacos/v1/cs/configs" `
+  --data-urlencode "dataId=user-service.yaml" `
+  --data-urlencode "group=DEFAULT_GROUP" `
+  --data-urlencode "content@docker/backup/nacos-configs/user-service.yaml"
+
+# Sentinel 流控/降级规则（可选，文件为空则不导入）
+```
+
+### 12.6 启动顺序与健康检查
+
+`depends_on` **只保证容器启动顺序，不保证服务就绪**。MySQL 容器进程起来了，但能接受连接可能还要 10-20 秒。
+
+学习环境用 `restart: unless-stopped` 兜底——微服务连不上依赖就崩溃，自动重启重试，等基础设施就绪后自然连上。
+
+生产环境推荐加 `healthcheck` + `depends_on: condition: service_healthy`。
+
+### 12.7 踩坑记录
+
+**坑 1：端口被宿主机旧进程占用**
+
+`docker compose up` 报 `ports are not available: 9411`。之前 Windows 上跑的 Zipkin 还占着 9411，容器映射同端口失败。
+
+```powershell
+Get-NetTCPConnection -LocalPort 9411 | Select-Object OwningProcess
+Stop-Process -Id <PID> -Force
+```
+
+**坑 2：broker 无限重启（exit 253），日志为空**
+
+最棘手的坑。排查了三层才找到根因：
+
+1. 先怀疑启动顺序 → 手动跑（不挂卷）成功，排除
+2. 再对比发现：**挂 named volume 就崩，不挂就正常**
+3. 根因：Docker named volume 默认归 root，RocketMQ 镜像用 `rocketmq` 用户运行，**无写权限**，JVM 在日志初始化前就崩溃了，所以 `docker logs` 没输出
+
+解决（学习环境简化）：
+
+```yaml
+broker:
+  user: root    # 加这一行
+```
+
+> 另：旧卷被停止的容器引用着删不掉，需先 `docker rm -f broker` 再 `docker volume rm`。
+
+**坑 3：MySQL 数据全没了**
+
+`docker run -v mysql-data:...` 创建的卷叫 `mysql-data`；compose 自动加项目前缀，创建的是 `spring-cloud-study_mysql-data`。**两个完全不同的卷**，新 MySQL 里只有 4 个系统库。
+
+解决见 12.5 导入备份。复用旧卷的方式：
+
+```yaml
+volumes:
+  mysql-data:
+    external: true    # 复用已存在的 mysql-data 卷
+```
+
+**坑 4：Nacos 配置也是空的**
+
+同理，新 nacos-data 卷是空的，需导入 `user-service.yaml` 等配置。
+
+**坑 5：`depends_on` 不等于"就绪"**
+
+微服务首次启动时 MySQL/Nacos 可能还没准备好，导致崩溃。靠 `restart: unless-stopped` 自动重试解决。
+
+### 12.8 全链路验证
+
+```powershell
+# 1. 登录（网关 9000 转发到 user-service）
+curl -X POST http://localhost:9000/api/login -H "Content-Type: application/json" `
+  -d '{"username":"zhangsan","password":"123456"}'
+
+# 2. 正常下单（Seata AT 提交：扣余额 + 建订单）
+curl -X POST "http://localhost:9000/api/orders/seata/create?userId=1&amount=100" `
+  -H "Authorization: Bearer <token>"
+
+# 3. forceFail 下单（Seata AT 回滚：余额不扣、订单不建）
+curl -X POST "http://localhost:9000/api/orders/seata/create?userId=1&amount=100&forceFail=true" `
+  -H "Authorization: Bearer <token>"
+
+# 4. RocketMQ 事务消息（积分异步 +100）
+# 5. Redis 缓存（GET /api/orders/1 两次，第二次命中 orderCache::users::1）
+```
+
+验证通过标准：登录返回 token、正常下单余额扣减、forceFail 后余额不变、积分增加、Redis 有缓存 key。

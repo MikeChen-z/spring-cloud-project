@@ -7,12 +7,12 @@ spring:
   # Redis 连接：网关限流的令牌桶状态存在这里（注意网关是 Reactive 栈，用 reactive redis 客户端）
   data:
     redis:
-      host: 127.0.0.1
+      host: ${REDIS_HOST:127.0.0.1}
       port: 6379
   cloud:
     nacos:
       discovery:
-        server-addr: 127.0.0.1:8848
+        server-addr: ${NACOS_ADDR:127.0.0.1:8848}
     gateway:
       routes:
         # 登录接口：白名单路径，无需 token
@@ -80,4 +80,4 @@ management:
       probability: 1.0
   zipkin:
     tracing:
-      endpoint: http://127.0.0.1:9411/api/v2/spans
+      endpoint: http://${ZIPKIN_HOST:127.0.0.1}:9411/api/v2/spans

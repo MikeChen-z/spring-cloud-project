@@ -7,7 +7,7 @@ spring:
   cloud:
     nacos:
       discovery:
-        server-addr: 127.0.0.1:8848
+        server-addr: ${NACOS_ADDR:127.0.0.1:8848}
     # Sentinel 控制台地址（不装 Dashboard 也能用 fallback，只是看不到可视化规则）
     # 学习阶段先不装 Dashboard，注释掉也不影响降级功能
     sentinel:
@@ -17,7 +17,7 @@ spring:
       datasource:
         flow:
           nacos:
-            server-addr: 127.0.0.1:8848
+            server-addr: ${NACOS_ADDR:127.0.0.1:8848}
             data-id: ${spring.application.name}-flow-rules.json
             group-id: SENTINEL_GROUP
             data-type: json
@@ -25,7 +25,7 @@ spring:
         # 熔断规则同样持久化到 Nacos，rule-type 换成 degrade
         degrade:
           nacos:
-            server-addr: 127.0.0.1:8848
+            server-addr: ${NACOS_ADDR:127.0.0.1:8848}
             data-id: ${spring.application.name}-degrade-rules.json
             group-id: SENTINEL_GROUP
             data-type: json
@@ -33,14 +33,14 @@ spring:
   
   # MySQL配置
   datasource:
-    url: jdbc:mysql://127.0.0.1:3306/order_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true
+    url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:3306/order_db?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true
     username: root
     password: 123456
     driver-class-name: com.mysql.cj.jdbc.Driver
   # Redis 连接配置
   data:
     redis:
-      host: 127.0.0.1
+      host: ${REDIS_HOST:127.0.0.1}
       port: 6379
   # Spring Cache 配置：底层切换为 Redis
   cache:
@@ -62,7 +62,7 @@ feign:
 # ========== RocketMQ 消息队列 ==========
 rocketmq:
   # NameServer 地址（服务发现，Broker 注册到这里）
-  name-server: 127.0.0.1:9876
+  name-server: ${NAMESRV_ADDR:127.0.0.1:9876}
   producer:
     # 生产者组名（同一组内消息负载均衡）
     group: order-service-producer-group
@@ -89,7 +89,7 @@ seata:
   registry:
     type: nacos
     nacos:
-      server-addr: 127.0.0.1:8848
+      server-addr: ${NACOS_ADDR:127.0.0.1:8848}
       namespace: ""
       group: SEATA_GROUP
       application: seata-server
@@ -108,4 +108,4 @@ management:
       probability: 1.0
   zipkin:
     tracing:
-      endpoint: http://127.0.0.1:9411/api/v2/spans
+      endpoint: http://${ZIPKIN_HOST:127.0.0.1}:9411/api/v2/spans

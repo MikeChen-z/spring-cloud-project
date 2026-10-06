@@ -1,0 +1,182 @@
+# Spring Cloud 学习项目 - 一键编排
+# 用法：docker compose up -d
+# 全部服务在 study-net 网络内通过服务名互通
+
+services:
+  # ========== 基础设施 ==========
+
+  mysql:
+    image: mysql:8.0
+    container_name: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: "123456"
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.4
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  nacos:
+    image: nacos/nacos-server:v2.4.0
+    container_name: nacos
+    environment:
+      MODE: standalone
+      NACOS_AUTH_ENABLE: "false"
+      JVM_XMS: 256m
+      JVM_XMX: 512m
+      JVM_XMN: 128m
+    ports:
+      - "8848:8848"
+      - "9848:9848"
+    volumes:
+      - nacos-data:/home/nacos/data
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  namesrv:
+    image: apache/rocketmq:4.9.7
+    container_name: namesrv
+    command: sh mqnamesrv
+    environment:
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+    ports:
+      - "9876:9876"
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  broker:
+    image: apache/rocketmq:4.9.7
+    container_name: broker
+    # RocketMQ 默认以 rocketmq 用户运行，对 Docker named volume 无写权限，学习环境用 root 简化
+    user: root
+    command: sh mqbroker -c /home/rocketmq/rocketmq-4.9.7/conf/broker.conf
+    environment:
+      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+    ports:
+      - "10909:10909"
+      - "10911:10911"
+    volumes:
+      - ./docker/rocketmq/broker.conf:/home/rocketmq/rocketmq-4.9.7/conf/broker.conf
+      - rocketmq-store:/home/rocketmq/store
+      - rocketmq-logs:/home/rocketmq/logs
+    depends_on:
+      - namesrv
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  seata:
+    image: seataio/seata-server:2.0.0
+    container_name: seata
+    environment:
+      JVM_XMS: 512m
+      JVM_XMX: 512m
+      JVM_MaxDirectMemorySize: 256m
+      TZ: Asia/Shanghai
+    ports:
+      - "8091:8091"
+      - "7091:7091"
+    volumes:
+      - ./docker/seata/application.yml:/seata-server/resources/application.yml
+    depends_on:
+      - nacos
+      - mysql
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  zipkin:
+    image: openzipkin/zipkin:3
+    container_name: zipkin
+    ports:
+      - "9411:9411"
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  # ========== 微服务 ==========
+
+  user-service:
+    image: user-service:1.0.0
+    container_name: user-service
+    ports:
+      - "8081:8081"
+    environment:
+      NACOS_ADDR: nacos:8848
+      MYSQL_HOST: mysql
+      REDIS_HOST: redis
+      NAMESRV_ADDR: namesrv:9876
+      ZIPKIN_HOST: zipkin
+    depends_on:
+      - nacos
+      - mysql
+      - redis
+      - namesrv
+      - seata
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  order-service:
+    image: order-service:1.0.0
+    container_name: order-service
+    ports:
+      - "8082:8082"
+    environment:
+      NACOS_ADDR: nacos:8848
+      MYSQL_HOST: mysql
+      REDIS_HOST: redis
+      NAMESRV_ADDR: namesrv:9876
+      ZIPKIN_HOST: zipkin
+    depends_on:
+      - nacos
+      - mysql
+      - redis
+      - namesrv
+      - seata
+    networks:
+      - study-net
+    restart: unless-stopped
+
+  gateway-service:
+    image: gateway-service:1.0.0
+    container_name: gateway-service
+    ports:
+      - "9000:9000"
+    environment:
+      NACOS_ADDR: nacos:8848
+      REDIS_HOST: redis
+      ZIPKIN_HOST: zipkin
+    depends_on:
+      - nacos
+      - redis
+    networks:
+      - study-net
+    restart: unless-stopped
+
+# ========== 网络与数据卷 ==========
+networks:
+  study-net:
+    driver: bridge
+
+volumes:
+  mysql-data:
+  redis-data:
+  nacos-data:
+  rocketmq-store:
+  rocketmq-logs:

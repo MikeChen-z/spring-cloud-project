@@ -1,0 +1,247 @@
+{
+    "info": {
+        "_postman_id": "spring-cloud-full-chain",
+        "name": "Spring Cloud 全链路验证",
+        "description": "Docker 容器化后的全链路验证：登录→网关鉴权→Seata AT→RocketMQ→Redis 缓存",
+        "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+    },
+    "item": [
+        {
+            "name": "1. 登录拿 Token",
+            "request": {
+                "method": "POST",
+                "header": [
+                    {
+                        "key": "Content-Type",
+                        "value": "application/json"
+                    }
+                ],
+                "url": {
+                    "raw": "http://localhost:9000/api/login",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "9000",
+                    "path": [
+                        "api",
+                        "login"
+                    ]
+                },
+                "body": {
+                    "mode": "raw",
+                    "raw": "{\"username\":\"张三\",\"password\":\"123456\"}",
+                    "options": {
+                        "raw": {
+                            "language": "json"
+                        }
+                    }
+                },
+                "description": "网关白名单路径，无需 token。响应里的 token 复制到环境变量 {{token}}"
+            }
+        },
+        {
+            "name": "2. 无 Token 应 401",
+            "request": {
+                "method": "GET",
+                "header": [],
+                "url": {
+                    "raw": "http://localhost:9000/api/orders/1",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "9000",
+                    "path": [
+                        "api",
+                        "orders",
+                        "1"
+                    ]
+                },
+                "description": "不携带 Authorization 头，网关应拦截返回 401"
+            }
+        },
+        {
+            "name": "3. 带 Token 访问（含 Feign 跨服务）",
+            "request": {
+                "method": "GET",
+                "header": [
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "url": {
+                    "raw": "http://localhost:9000/api/orders/1",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "9000",
+                    "path": [
+                        "api",
+                        "orders",
+                        "1"
+                    ]
+                },
+                "description": "网关路由到 order-service，order-service 内部 Feign 调 user-service，返回 user 信息"
+            }
+        },
+        {
+            "name": "4. Seata AT 正常提交",
+            "request": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                    "raw": "http://localhost:8082/orders/seata/create?userId=1&amount=100",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "8082",
+                    "path": [
+                        "orders",
+                        "seata",
+                        "create"
+                    ],
+                    "query": [
+                        {
+                            "key": "userId",
+                            "value": "1"
+                        },
+                        {
+                            "key": "amount",
+                            "value": "100"
+                        }
+                    ]
+                },
+                "description": "全局事务：写订单表 + 远程扣余额，成功提交。验数据：mysql 查 t_user 余额、t_order 新订单"
+            }
+        },
+        {
+            "name": "5. Seata AT 回滚",
+            "request": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                    "raw": "http://localhost:8082/orders/seata/create?userId=1&amount=100&forceFail=true",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "8082",
+                    "path": [
+                        "orders",
+                        "seata",
+                        "create"
+                    ],
+                    "query": [
+                        {
+                            "key": "userId",
+                            "value": "1"
+                        },
+                        {
+                            "key": "amount",
+                            "value": "100"
+                        },
+                        {
+                            "key": "forceFail",
+                            "value": "true"
+                        }
+                    ]
+                },
+                "description": "模拟远程扣款失败，全局事务回滚，订单不应写入。预期返回 500"
+            }
+        },
+        {
+            "name": "6. RocketMQ 事务消息",
+            "request": {
+                "method": "POST",
+                "header": [],
+                "url": {
+                    "raw": "http://localhost:8082/orders/rocketmq/create?userId=1&amount=50",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "8082",
+                    "path": [
+                        "orders",
+                        "rocketmq",
+                        "create"
+                    ],
+                    "query": [
+                        {
+                            "key": "userId",
+                            "value": "1"
+                        },
+                        {
+                            "key": "amount",
+                            "value": "50"
+                        }
+                    ]
+                },
+                "description": "半消息 → 本地事务 → 提交/回查。等 3 秒后查 t_user.points 和 t_points_log"
+            }
+        },
+        {
+            "name": "7. Redis 缓存验证（第一次）",
+            "request": {
+                "method": "GET",
+                "header": [
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "url": {
+                    "raw": "http://localhost:9000/api/orders/1",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "9000",
+                    "path": [
+                        "api",
+                        "orders",
+                        "1"
+                    ]
+                },
+                "description": "第一次调用：可能走 Feign（缓存未命中）"
+            }
+        },
+        {
+            "name": "8. Redis 缓存验证（第二次，应命中）",
+            "request": {
+                "method": "GET",
+                "header": [
+                    {
+                        "key": "Authorization",
+                        "value": "Bearer {{token}}"
+                    }
+                ],
+                "url": {
+                    "raw": "http://localhost:9000/api/orders/1",
+                    "protocol": "http",
+                    "host": [
+                        "localhost"
+                    ],
+                    "port": "9000",
+                    "path": [
+                        "api",
+                        "orders",
+                        "1"
+                    ]
+                },
+                "description": "第二次调用：order-service 的 getUserWithCache 命中 Redis，不触发 Feign"
+            }
+        }
+    ],
+    "variable": [
+        {
+            "key": "token",
+            "value": "",
+            "type": "string"
+        }
+    ]
+}
