@@ -136,11 +136,13 @@ services:
 
   # ========== 微服务 ==========
 
+  # 微服务默认单实例；高可用演示用 --scale 起多副本：
+  #   docker compose up -d --scale user-service=2 --scale order-service=2
+  # 因此这里【不能写 container_name】（副本同名会冲突），
+  # 也【不映射宿主机端口】（多副本抢同一宿主端口）——
+  # 外部统一从网关 9000 进入，服务间经 study-net 服务名访问，本就不需要宿主机直达。
   user-service:
     image: user-service:1.0.0
-    container_name: user-service
-    ports:
-      - "8081:8081"
     environment:
       NACOS_ADDR: nacos:8848
       MYSQL_HOST: mysql
@@ -160,9 +162,6 @@ services:
 
   order-service:
     image: order-service:1.0.0
-    container_name: order-service
-    ports:
-      - "8082:8082"
     environment:
       NACOS_ADDR: nacos:8848
       MYSQL_HOST: mysql
@@ -179,6 +178,7 @@ services:
       - study-net
     restart: unless-stopped
     # order 最重（Xmx384 + Metaspace256 + 线程栈/直接内存），容器上限留到 700m 防 OOMKilled
+    # 注意：双副本时上限是单副本的，总占用约 2 倍
     mem_limit: 700m
 
   gateway-service:

@@ -2,7 +2,7 @@
     "info": {
         "_postman_id": "spring-cloud-full-chain",
         "name": "Spring Cloud 全链路验证",
-        "description": "统一返回体 Result 契约版。按文件夹顺序用 Collection Runner 一键执行：登录(自动存 token)→参数校验→网关鉴权→Seata AT→RocketMQ→Redis 缓存。\n约定：成功 {code:200,message,data}；业务/参数错误 400；未认证 401；forceFail 500。",
+        "description": "统一返回体 Result 契约版。按文件夹顺序用 Collection Runner 一键执行：登录(自动存 token)→参数校验→网关鉴权→Seata AT→RocketMQ→Redis 缓存→接口幂等→链路追踪。\n约定：成功 {code:200,message,data}；业务/参数错误 400；未认证 401；forceFail 500。所有业务请求统一经网关 http://localhost:9000/api（order/user 双副本不映射宿主机端口）。",
         "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
     },
     "item": [
@@ -453,14 +453,20 @@
                     ],
                     "request": {
                         "method": "POST",
-                        "header": [],
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            }
+                        ],
                         "url": {
-                            "raw": "http://localhost:8082/orders/seata/create?userId=1&amount=100",
+                            "raw": "http://localhost:9000/api/orders/seata/create?userId=1&amount=100",
                             "host": [
                                 "localhost"
                             ],
-                            "port": "8082",
+                            "port": "9000",
                             "path": [
+                                "api",
                                 "orders",
                                 "seata",
                                 "create"
@@ -476,7 +482,7 @@
                                 }
                             ]
                         },
-                        "description": "直连 order-service 绕过网关。全局事务：写订单 + Feign 扣余额，两阶段提交。\nSQL 验证：余额 -100、t_order +1；3 秒后积分 +100（afterCommit 普通消息）。"
+                        "description": "经网关访问 order-service（双副本已不映射宿主机端口，9000 是唯一入口）。全局事务：写订单 + Feign 扣余额，两阶段提交。\nSQL 验证：余额 -100、t_order +1；3 秒后积分 +100（afterCommit 普通消息）。"
                     }
                 },
                 {
@@ -496,14 +502,20 @@
                     ],
                     "request": {
                         "method": "POST",
-                        "header": [],
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            }
+                        ],
                         "url": {
-                            "raw": "http://localhost:8082/orders/seata/create?userId=1&amount=100&forceFail=true",
+                            "raw": "http://localhost:9000/api/orders/seata/create?userId=1&amount=100&forceFail=true",
                             "host": [
                                 "localhost"
                             ],
-                            "port": "8082",
+                            "port": "9000",
                             "path": [
+                                "api",
                                 "orders",
                                 "seata",
                                 "create"
@@ -549,14 +561,20 @@
                     ],
                     "request": {
                         "method": "POST",
-                        "header": [],
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            }
+                        ],
                         "url": {
-                            "raw": "http://localhost:8082/orders/rocketmq/create?userId=1&amount=50",
+                            "raw": "http://localhost:9000/api/orders/rocketmq/create?userId=1&amount=50",
                             "host": [
                                 "localhost"
                             ],
-                            "port": "8082",
+                            "port": "9000",
                             "path": [
+                                "api",
                                 "orders",
                                 "rocketmq",
                                 "create"
@@ -655,11 +673,309 @@
                     }
                 }
             ]
+        },
+        {
+            "name": "7. 接口幂等（Redis 防重令牌，必须按顺序执行）",
+            "description": "令牌在业务执行前被 Lua 原子消费，5 分钟内一次性有效。Collection Runner 中 7.2/7.3/7.4 必须排在 7.1 之后；若 7.2 因业务原因失败（如余额不足），需重跑 7.1 取新令牌。",
+            "item": [
+                {
+                    "name": "7.1 获取幂等令牌（自动保存 idemToken）",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                                    "const res = pm.response.json();",
+                                    "pm.test('data.token 非空', () => pm.expect(res.data.token).to.be.a('string'));",
+                                    "pm.collectionVariables.set('idemToken', res.data.token);",
+                                    "console.log('幂等令牌已保存:', res.data.token, 'TTL=', res.data.expiresInSeconds, 's');"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            }
+                        ],
+                        "url": {
+                            "raw": "http://localhost:9000/api/orders/idempotent/token",
+                            "host": [
+                                "localhost"
+                            ],
+                            "port": "9000",
+                            "path": [
+                                "api",
+                                "orders",
+                                "idempotent",
+                                "token"
+                            ]
+                        },
+                        "description": "后端 SET key=idem:seata:{uuid}、value=用户标识、TTL 300s。令牌只能用一次。"
+                    }
+                },
+                {
+                    "name": "7.2 携令牌首次下单（应 200，余额 -66）",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                                    "pm.test('下单成功', () => pm.expect(pm.response.json().data.success).to.eql(true));",
+                                    "console.log('首次成功，令牌已被 Lua 原子删除；SQL: 余额 -66、t_order +1');"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            },
+                            {
+                                "key": "Idempotent-Token",
+                                "value": "{{idemToken}}"
+                            }
+                        ],
+                        "url": {
+                            "raw": "http://localhost:9000/api/orders/seata/create-idem?userId=1&amount=66",
+                            "host": [
+                                "localhost"
+                            ],
+                            "port": "9000",
+                            "path": [
+                                "api",
+                                "orders",
+                                "seata",
+                                "create-idem"
+                            ],
+                            "query": [
+                                {
+                                    "key": "userId",
+                                    "value": "1"
+                                },
+                                {
+                                    "key": "amount",
+                                    "value": "66"
+                                }
+                            ]
+                        },
+                        "description": "进入业务前先执行 Lua：GET 比对 owner 后 DEL，两步原子完成；消费成功才下单。"
+                    }
+                },
+                {
+                    "name": "7.3 同一令牌重复提交（应 400）",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('HTTP 400', () => pm.response.to.have.status(400));",
+                                    "pm.test('提示请勿重复提交', () =>",
+                                    "    pm.expect(pm.response.json().message).to.include('请勿重复提交'));",
+                                    "console.log('SQL 复核：余额、订单数与 7.2 后完全一致');"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            },
+                            {
+                                "key": "Idempotent-Token",
+                                "value": "{{idemToken}}"
+                            }
+                        ],
+                        "url": {
+                            "raw": "http://localhost:9000/api/orders/seata/create-idem?userId=1&amount=66",
+                            "host": [
+                                "localhost"
+                            ],
+                            "port": "9000",
+                            "path": [
+                                "api",
+                                "orders",
+                                "seata",
+                                "create-idem"
+                            ],
+                            "query": [
+                                {
+                                    "key": "userId",
+                                    "value": "1"
+                                },
+                                {
+                                    "key": "amount",
+                                    "value": "66"
+                                }
+                            ]
+                        },
+                        "description": "模拟用户狂点提交按钮/网络重试：Lua GET 不到 key → 返回 0 → 400，业务零执行。"
+                    }
+                },
+                {
+                    "name": "7.4 不带令牌头（应 400）",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('HTTP 400', () => pm.response.to.have.status(400));",
+                                    "pm.test('提示缺少 Idempotent-Token', () =>",
+                                    "    pm.expect(pm.response.json().message).to.include('Idempotent-Token'));"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "POST",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            }
+                        ],
+                        "url": {
+                            "raw": "http://localhost:9000/api/orders/seata/create-idem?userId=1&amount=66",
+                            "host": [
+                                "localhost"
+                            ],
+                            "port": "9000",
+                            "path": [
+                                "api",
+                                "orders",
+                                "seata",
+                                "create-idem"
+                            ],
+                            "query": [
+                                {
+                                    "key": "userId",
+                                    "value": "1"
+                                },
+                                {
+                                    "key": "amount",
+                                    "value": "66"
+                                }
+                            ]
+                        }
+                    }
+                }
+            ]
+        },
+        {
+            "name": "8. 分布式链路追踪",
+            "item": [
+                {
+                    "name": "8.1 响应头携带 X-Trace-Id",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "pm.test('HTTP 200', () => pm.response.to.have.status(200));",
+                                    "const traceId = pm.response.headers.get('X-Trace-Id');",
+                                    "pm.test('响应头 X-Trace-Id 非空', () => pm.expect(traceId).to.be.a('string').that.is.not.empty);",
+                                    "console.log('X-Trace-Id =', traceId);",
+                                    "console.log('日志串联: docker compose logs order-service | Select-String ' + JSON.stringify(traceId));",
+                                    "console.log('Zipkin UI: http://localhost:9411/trace/' + traceId);",
+                                    "pm.collectionVariables.set('traceId', traceId);"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [
+                            {
+                                "key": "Authorization",
+                                "value": "Bearer {{token}}"
+                            }
+                        ],
+                        "url": {
+                            "raw": "http://localhost:9000/api/orders/1",
+                            "host": [
+                                "localhost"
+                            ],
+                            "port": "9000",
+                            "path": [
+                                "api",
+                                "orders",
+                                "1"
+                            ]
+                        },
+                        "description": "TraceIdResponseFilter 把 Micrometer MDC 中的 traceId 写入响应头；网关原样透传下游响应头。拿到后可在 Zipkin UI 直接打开完整调用链（gateway→order→user 共 4 个 span）。"
+                    }
+                },
+                {
+                    "name": "8.2 Zipkin API 查询该 trace",
+                    "event": [
+                        {
+                            "listen": "test",
+                            "script": {
+                                "type": "text/javascript",
+                                "exec": [
+                                    "const spans = pm.response.json();",
+                                    "pm.test('至少 2 个 span', () => pm.expect(spans.length).to.be.at.least(2));",
+                                    "const services = [...new Set(spans.map(s => s.localEndpoint.serviceName))];",
+                                    "pm.test('覆盖 gateway-service 与 order-service', () => {",
+                                    "    pm.expect(services).to.include('gateway-service');",
+                                    "    pm.expect(services).to.include('order-service');",
+                                    "});",
+                                    "console.log('span 数:', spans.length, '服务:', services.join('/'));"
+                                ]
+                            }
+                        }
+                    ],
+                    "request": {
+                        "method": "GET",
+                        "header": [],
+                        "url": {
+                            "raw": "http://localhost:9411/api/v2/trace/{{traceId}}",
+                            "host": [
+                                "localhost"
+                            ],
+                            "port": "9411",
+                            "path": [
+                                "api",
+                                "v2",
+                                "trace",
+                                "{{traceId}}"
+                            ]
+                        },
+                        "description": "必须先执行 8.1 生成 traceId 变量。返回 span 数组，含各服务名称、耗时与父子关系。"
+                    }
+                }
+            ]
         }
     ],
     "variable": [
         {
             "key": "token",
+            "value": "",
+            "type": "string"
+        },
+        {
+            "key": "idemToken",
+            "value": "",
+            "type": "string"
+        },
+        {
+            "key": "traceId",
             "value": "",
             "type": "string"
         }

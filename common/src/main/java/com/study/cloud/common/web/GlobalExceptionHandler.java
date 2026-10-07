@@ -15,6 +15,7 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 import org.springframework.web.server.ResponseStatusException;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 
 import java.util.stream.Collectors;
 
@@ -73,6 +74,17 @@ public class GlobalExceptionHandler {
         log.warn("【参数约束失败】{}", detail);
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)
                 .body(Result.fail(ResultCode.PARAM_ERROR.getCode(), detail));
+    }
+
+    /**
+     * 请求体无法读取/解析：body 为空、JSON 格式错误、字段类型不匹配等。
+     * 典型场景：调用方发出的 JSON 缺引号、压根没带 body → 400 而非 500。
+     */
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    public ResponseEntity<Result<Void>> handleNotReadable(HttpMessageNotReadableException ex) {
+        log.warn("【请求体解析失败】{}", ex.getMostSpecificCause().getMessage());
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(Result.fail(ResultCode.PARAM_ERROR.getCode(), "请求体格式错误或缺失，请检查 JSON 是否合法"));
     }
 
     /**

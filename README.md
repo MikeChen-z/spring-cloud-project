@@ -841,13 +841,13 @@ volumes:
 
 ### 12.8 全链路验证（一键脚本）
 
-统一返回体改造后，推荐直接跑自动化脚本，覆盖 19 项断言（登录 / 参数校验 / 网关鉴权 / Seata 提交与回滚 / RocketMQ 普通消息+事务消息 / Redis 缓存），全部基于数据库前后差值校验，可重复执行：
+统一返回体改造后，推荐直接跑自动化脚本，覆盖 34 项断言（登录 / 参数校验 / 网关鉴权 / Seata 提交与回滚 / RocketMQ 普通消息+事务消息 / Redis 缓存 / 接口幂等 / 链路追踪），全部基于数据库前后差值校验；脚本开头会把测试账户重置为余额、积分各 1000，可无限次重复执行：
 
 ```powershell
 .\verify-full-chain.ps1        # 全绿退出码 0，有失败非 0（可接入 CI）
 ```
 
-也可在 Postman 导入 `docker/backup/Spring-Cloud-FullChain.postman_collection.json`，用 Collection Runner 顺序执行 14 个请求（登录 Tests 自动提取 `data.token` 存入集合变量，无需手动复制）。
+也可在 Postman 导入 `docker/backup/Spring-Cloud-FullChain.postman_collection.json`，用 Collection Runner 顺序执行 8 个文件夹共 20 个请求（登录 Tests 自动提取 `data.token` 存入集合变量，幂等用例自动传递 `idemToken`，无需手动复制）。
 
 手动验证的关键请求（经网关 9000）：
 
@@ -928,3 +928,110 @@ autoMemoryReclaim=gradual
 - JVM 实际常驻 ≈ 堆 + Metaspace + 线程栈 + 直接内存，通常是堆的 1.5~2 倍，所以 `mem_limit` 不能只按 `-Xmx` 设。
 - WSL2 借走的内存默认不主动归还 Windows（只涨不跌是正常现象，非泄漏）；改 `.wslconfig` 后需 `wsl --shutdown` 完全重启才生效。
 - ⚠️ Windows PowerShell 5.1 执行带中文的脚本/请求有两个编码坑：① `.ps1` 含中文须保存为 **带 BOM 的 UTF-8**，否则按 GBK 解析导致语法错误；② `Invoke-RestMethod` 发中文 body 要显式 `[Text.Encoding]::UTF8.GetBytes(...)`。脚本中均已处理。
+
+## 十三、生产级三要素：接口幂等 / 服务高可用 / 链路追踪
+
+前面把功能跑通了，这一课补齐"上生产"前绕不开的三件事：**重复请求只生效一次、单实例挂了业务不停、出问题能按一次请求把日志和调用链串起来**。
+
+### 13.1 接口幂等：Redis 防重令牌 + Lua 原子消费
+
+**问题**：下单这类写接口，重复执行会直接造成资损。重复来自三条路：用户狂点提交按钮、网络抖动导致客户端/网关超时重试、MQ 重投。本项目里 MQ 消费端已用 `t_points_log.biz_no` 唯一索引兜底（见 10.6），同步下单接口则采用"防重令牌"。
+
+**流程**（代码：`IdempotentTokenService` + `OrderController` 两个新端点）：
+
+```
+进入下单页                提交订单（请求头 Idempotent-Token）
+   │                            │
+   ▼                            ▼
+GET /orders/idempotent/token   ① Lua 原子"比对 owner + 删除"
+Redis SET idem:seata:{uuid}    ├─ 返回 1（令牌有效）→ ② 执行业务下单
+      = 用户标识 EX 300        └─ 返回 0（用过/不存在/盗用）→ 400 拒绝，业务零执行
+```
+
+两个关键设计：
+
+1. **校验+销毁必须原子，所以用 Lua**。`GET` 判断存在再 `DEL` 是两条命令，高并发下两个请求可能都 `GET` 成功然后双双放行；Redis 单线程执行 Lua，比对与删除在一个脚本内完成，中间插不进别的命令：
+
+   ```lua
+   if redis.call('get', KEYS[1]) == ARGV[1] then
+       return redis.call('del', KEYS[1])   -- 是我的令牌：销毁并放行
+   else
+       return 0                            -- 重复/不存在/别人的：拒绝
+   end
+   ```
+
+2. **令牌 value 存签发用户**（网关注入的 `X-User-Id`）。即使 A 的令牌 UUID 被 B 拿到，owner 对不上一样消费失败；令牌 5 分钟 TTL，下单页放久自动作废。
+
+实测（脚本第 8 章 9 项断言）：取令牌 → Redis 查到 key 且 TTL=300 → 首次提交 200、余额 -66、订单 +1、令牌被删除 → **同一令牌第二次 400「请勿重复提交」→ 不带令牌头 400** → 两次拦截后余额、订单数纹丝不动。
+
+边界与选型说明：
+
+- 令牌在**业务之前**消费：业务若因别的原因失败（如余额不足），令牌同样作废，用户需重新取令牌。它防的是重复提交，不保证业务成功。
+- 防重令牌适合"客户端主动发起 + 交互前能取号"的场景；服务间回调/MQ 消费更适合**唯一键去重**（本项目积分流水即此方案）；强一致的资金核心则需要状态机 + 乐观锁，令牌只是第一道闸。
+
+### 13.2 服务高可用：多副本 + Nacos 负载均衡 + 故障转移
+
+**Compose 改造**：`user-service`/`order-service` 去掉 `container_name` 和宿主机 `ports`——前者副本同名会冲突，后者多副本抢同一宿主端口。外部本就统一走网关 9000，服务间走 Docker 网络用服务名互访，不需要宿主机直达：
+
+```bash
+# user/order 各起两个副本（容器名变为 project-user-service-1/2）
+docker compose up -d --scale user-service=2 --scale order-service=2
+```
+
+**负载均衡**：两个副本启动后各自注册 Nacos（服务列表 2+2 healthy）。网关与 OpenFeign 内置 Spring Cloud LoadBalancer，默认**轮询**。`GET /api/orders/{id}` 响应里新增 `serverInstance` 字段（取容器主机名 = 容器 ID 前缀），连打 8 次严格 4:4 落到两个实例，肉眼可证。
+
+**故障转移实测**：
+
+| 操作 | 现象 | 原理 |
+|---|---|---|
+| `docker stop` 一个 order 副本 | 立刻连打 10 次请求，**0 失败**，流量全给存活实例 | 优雅停机：进程收到 SIGTERM 后主动从 Nacos 注销，新请求不再分过来 |
+| 模拟宕机（`kill -9`/断电） | 约 **15 秒**内容错/失败窗口，之后摘除 | 进程没机会注销，靠 Nacos 心跳超时（默认 5s 心跳 × 数次）被动判定不健康 |
+| `docker start` 恢复 | 重新注册，流量回到两实例轮询 | — |
+
+要点：生产发布用滚动停机（先发 SIGTERM、等注销和在途请求处理完再退出，Spring Boot 优雅停机默认开启），用户无感知；而宕机场景靠客户端重试/降级兜住摘除前的空窗（Ribbon/LoadBalancer 也会对连接失败做重试，本项目 Sentinel 降级是同一位置的另一道防线）。
+
+**内存代价**：副本数翻倍，user/order 各多出一份 JVM，实测 WSL2 总占用约 +0.8GB（2.9GB → 约 3.7GB，受 `.wslconfig` 5GB 上限约束仍可跑）。生产环境副本数 = 容量规划问题，不是越多越好。
+
+### 13.3 链路追踪：X-Trace-Id 响应头 + 日志串联 + Zipkin
+
+依赖（micrometer-tracing-bridge-brave + zipkin-reporter-brave）和 Zipkin 容器在容器化课程已就位，三个服务采样率均为 100%。但 traceId 默认只在服务内部可见，排查时调用方报不出"我这次请求的编号"。本课在 common 模块新增 `TraceIdResponseFilter`：
+
+- `OncePerRequestFilter` + `@Order(0)`（排在 tracing 过滤器之后），从 SLF4J MDC 取 micrometer 写入的 `traceId`，回填响应头 **`X-Trace-Id`**；
+- `finally` 兜底：链内才确定 traceId、或 4xx/5xx 异常响应时，只要响应未提交也补上——排查失败请求反而更需要它；
+- 网关是响应式代理，自动透传下游响应头，无需改动。
+
+**一条 traceId 的三种用法**（以 `GET /api/orders/2` 为例，实测 traceId=`6ac5c755...`）：
+
+```powershell
+# ① 调用方直接拿到编号（响应头）
+$r = Invoke-WebRequest "http://localhost:9000/api/orders/2" -Headers @{Authorization="Bearer <token>"}
+$r.Headers['X-Trace-Id']
+
+# ② 多容器日志按同一 traceId 串联（compose 聚合两个副本的日志）
+docker compose logs order-service --since 5m | Select-String '6ac5c755...'
+docker compose logs user-service  --since 5m | Select-String '6ac5c755...'
+
+# ③ Zipkin API / UI 看完整 span 链
+curl.exe "http://localhost:9411/api/v2/trace/6ac5c755..."
+# 浏览器：http://localhost:9411/trace/6ac5c755...
+```
+
+实测一条 `gateway → order → Feign → user` 的请求在 Zipkin 中是 **4 个 span**（网关入口/转发、`GET /orders/{id}`、`GET /users/{id}`），共享同一 traceId；日志中则表现为 `[traceId-spanId]`——**traceId 全链路相同，spanId 每跳不同**，靠 spanId 还能区分调用层次。
+
+两个观察到的坑（值得记住）：
+
+- **MyBatis 的 SQL 日志走 stdout 不经 SLF4J**，不带 `[traceId]`；想让 SQL 也进链路，要把 `log-impl` 换成走 SLF4J 的实现。
+- **WebFlux 网关默认不把 MDC 写进日志**（响应式线程切换会丢 ThreadLocal），网关侧排查以 Zipkin span 为准；Servlet 栈的 user/order 日志则完整带 traceId。
+- Redis 缓存命中时不会产生 user 服务 span（Feign 被短路），属正常现象。
+
+### 13.4 顺带修复：坏 JSON 不再是 500
+
+排查中用 curl 传了一个缺引号的非法 JSON，服务端返回 500。`HttpMessageNotReadableException`（请求体为空/JSON 非法）本质是客户端错误，已在 `GlobalExceptionHandler` 中归类为 **400「请求体格式错误或缺失」**，与参数缺失、类型不匹配一致。至此脚本第 1 章新增对应断言。
+
+### 13.5 验证产物
+
+| 产物 | 内容 |
+|---|---|
+| `verify-full-chain.ps1` | 34 项断言，新增第 8 章幂等（9 项，含 Redis TTL/令牌删除/重复与缺失拦截/DB 差值）、第 9 章追踪（X-Trace-Id 头、serverInstance、Zipkin span 覆盖 gateway+order） |
+| Postman 集合 | 8 个文件夹 20 个请求；新增「7. 接口幂等」「8. 分布式链路追踪」，原 Seata/RocketMQ 请求全部从直连 8082 改为经网关 9000 |
+| 新增/改动代码 | `IdempotentTokenService`、`OrderController` 幂等两端点 + `serverInstance`、common 的 `TraceIdResponseFilter` 与坏 JSON 异常归类、compose 去固定名/端口支持 scale |

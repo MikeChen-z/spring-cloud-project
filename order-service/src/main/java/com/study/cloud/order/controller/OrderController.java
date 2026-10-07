@@ -2,6 +2,7 @@ package com.study.cloud.order.controller;
 
 import com.study.cloud.common.result.Result;
 import com.study.cloud.order.dto.UserDto;
+import com.study.cloud.order.service.IdempotentTokenService;
 import com.study.cloud.order.service.OrderService;
 import com.study.cloud.order.service.OrderTxService;
 import jakarta.validation.constraints.DecimalMin;
@@ -18,7 +19,9 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.math.BigDecimal;
+import java.net.InetAddress;
 import java.net.URLDecoder;
+import java.net.UnknownHostException;
 import java.nio.charset.StandardCharsets;
 import java.util.LinkedHashMap;
 import java.util.Map;
@@ -40,6 +43,22 @@ public class OrderController {
 
     private final OrderService orderService;
     private final OrderTxService orderTxService;
+    private final IdempotentTokenService idempotentTokenService;
+
+    /**
+     * 当前实例的主机名。Docker 容器中即容器 ID 前缀，
+     * 多实例部署时响应里带上它，可以直观看到请求被负载均衡到了哪个实例。
+     */
+    private static final String HOSTNAME;
+    static {
+        String name;
+        try {
+            name = InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            name = "unknown-host";
+        }
+        HOSTNAME = name;
+    }
 
     @GetMapping("/{id}")
     public Result<Map<String, Object>> getById(
@@ -69,6 +88,8 @@ public class OrderController {
         result.put("order", order);
         result.put("user", user);
         result.put("currentUser", currentUserName == null ? "匿名（未经过网关/未登录）" : currentUserName);
+        // 处理本次请求的实例标识：多副本时连续调用可观察负载均衡轮询
+        result.put("serverInstance", HOSTNAME);
         return Result.success(result);
     }
 
@@ -106,6 +127,54 @@ public class OrderController {
         result.put("success", true);
         result.put("orderId", orderId);
         result.put("message", "全局事务已提交（订单 + 扣款均生效）");
+        return Result.success(result);
+    }
+
+    /**
+     * 幂等第一步：获取一次性防重令牌。
+     * 前端进入下单页时调用，提交订单时放到 Idempotent-Token 请求头。
+     *
+     * 经网关：GET http://localhost:9000/api/orders/idempotent/token（需登录）
+     */
+    @GetMapping("/idempotent/token")
+    public Result<Map<String, Object>> idempotentToken(
+            @RequestHeader(value = "X-User-Id", required = false) String currentUserId) {
+        String token = idempotentTokenService.issueToken(currentUserId);
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("token", token);
+        result.put("header", "Idempotent-Token");
+        result.put("expiresInSeconds", 300);
+        return Result.success(result);
+    }
+
+    /**
+     * 幂等第二步：携带令牌下单（业务逻辑与 /seata/create 完全一致）。
+     *
+     * 同一令牌：第一次 200 正常下单，第二次 400「请勿重复提交」，
+     * 余额只扣一次、订单只建一条。
+     *
+     * 经网关：POST
+     * http://localhost:9000/api/orders/seata/create-idem?userId=1&amount=100
+     * 请求头：Idempotent-Token: <第一步拿到的 token>
+     */
+    @PostMapping("/seata/create-idem")
+    public Result<Map<String, Object>> seataCreateIdempotent(
+            @RequestHeader(value = "Idempotent-Token", required = false) String token,
+            @RequestHeader(value = "X-User-Id", required = false) String currentUserId,
+            @NotNull(message = "userId 不能为空") @RequestParam Long userId,
+            @RequestParam(defaultValue = "幂等下单演示") String product,
+            @NotNull(message = "amount 不能为空") @DecimalMin(value = "0.01", message = "下单金额必须大于 0") @RequestParam BigDecimal amount,
+            @RequestParam(defaultValue = "false") boolean forceFail) {
+
+        // 先原子消费令牌：拿不到（重复/缺失/盗用）直接抛异常，后面的业务一行都不执行
+        idempotentTokenService.consumeOrThrow(token, currentUserId);
+
+        Long orderId = orderService.createOrder(userId, product, amount, forceFail);
+
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("success", true);
+        result.put("orderId", orderId);
+        result.put("message", "幂等下单成功（令牌已销毁，重复提交将被拒绝）");
         return Result.success(result);
     }
 
