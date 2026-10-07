@@ -17,4 +17,8 @@ ENV TZ=Asia/Shanghai
 
 # 启动命令：java -jar，顺带限制堆内存（学习机内存有限）
 # ENTRYPOINT 的数组形式不会被 shell 解析，参数传递更可靠
-ENTRYPOINT ["java", "-Xms256m", "-Xmx512m", "-jar", "app.jar"]
+# 内存参数（学习环境数据量极小，刻意压小）：
+#   -Xms128m 初始堆，启动只认领 128m，用多少再扩（之前 256m 启动即全额占用）
+#   -Xmx256m 最大堆封顶
+#   -XX:MaxMetaspaceSize 类元数据封顶（默认无上限，Spring 应用实际约 100m 出头）
+ENTRYPOINT ["java", "-Xms128m", "-Xmx256m", "-XX:MaxMetaspaceSize=256m", "-jar", "app.jar"]

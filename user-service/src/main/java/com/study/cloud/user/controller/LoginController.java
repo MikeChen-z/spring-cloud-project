@@ -1,9 +1,11 @@
 package com.study.cloud.user.controller;
 
+import com.study.cloud.common.result.Result;
 import com.study.cloud.user.dto.LoginRequest;
 import com.study.cloud.user.entity.User;
 import com.study.cloud.user.service.UserService;
 import com.study.cloud.user.util.JwtUtil;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -28,17 +30,17 @@ public class LoginController {
     private final JwtUtil jwtUtil;
 
     @PostMapping("/login")
-    public Map<String, Object> login(@RequestBody LoginRequest request) {
-        // 校验失败会抛 ResponseStatusException(401)，由 Spring 转成错误响应
+    public Result<Map<String, Object>> login(@Valid @RequestBody LoginRequest request) {
+        // 校验失败由全局异常处理器统一返回 401（用户不存在/密码错误）或 400（参数为空）
         User user = userService.login(request.username(), request.password());
 
         // 校验通过：用用户 id 和用户名签发 token
         String token = jwtUtil.generate(user.getId(), user.getName());
 
-        return Map.of(
+        return Result.success(Map.of(
                 "token", token,
                 "userId", user.getId(),
                 "username", user.getName()
-        );
+        ));
     }
 }

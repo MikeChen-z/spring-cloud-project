@@ -1,5 +1,6 @@
 package com.study.cloud.user.controller;
 
+import com.study.cloud.common.result.Result;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.cloud.context.config.annotation.RefreshScope;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -25,7 +26,7 @@ public class ConfigDemoController {
     private String greeting;
 
     @GetMapping
-    public Map<String, String> greeting() {
-        return Map.of("greeting", greeting);
+    public Result<Map<String, String>> greeting() {
+        return Result.success(Map.of("greeting", greeting));
     }
 }

@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>com.study</groupId>
+        <artifactId>spring-cloud-study</artifactId>
+        <version>1.0.0</version>
+    </parent>
+
+    <artifactId>common</artifactId>
+    <name>common</name>
+    <description>微服务共享基础件：统一返回体 Result、业务异常、MVC 全局异常处理</description>
+
+    <dependencies>
+        <!--
+          提供 @RestControllerAdvice / ResponseEntity / MethodArgumentNotValidException 等 Web 类型。
+          optional=true：本模块编译需要，但不随 common 传递给引用方。
+          这样即使响应式的 gateway-service 将来引用 common，也不会被拖入 Servlet 栈（spring-webmvc）。
+          user/order 本身已引入 spring-boot-starter-web，运行期由它们自己提供。
+        -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-web</artifactId>
+            <optional>true</optional>
+        </dependency>
+
+        <!-- Bean Validation（@Valid、ConstraintViolationException），同样只在编译期需要、不强制传递 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-validation</artifactId>
+            <optional>true</optional>
+        </dependency>
+    </dependencies>
+
+</project>

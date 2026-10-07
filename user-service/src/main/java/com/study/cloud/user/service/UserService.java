@@ -1,12 +1,12 @@
 package com.study.cloud.user.service;
 
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.study.cloud.common.exception.BusinessException;
+import com.study.cloud.common.result.ResultCode;
 import com.study.cloud.user.entity.User;
 import com.study.cloud.user.mapper.UserMapper;
-import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
-import org.springframework.web.server.ResponseStatusException;
 
 import java.math.BigDecimal;
 
@@ -25,13 +25,13 @@ public class UserService extends ServiceImpl<UserMapper, User> {
      * 学习工程使用明文比对；真实项目中库里存的是 BCrypt 哈希，
      * 这里应使用 passwordEncoder.matches(raw, user.getPassword())。
      *
-     * 校验失败抛 401，Spring MVC 会把 ResponseStatusException 转成对应状态码响应。
+     * 校验失败抛业务异常（HTTP 401），全局异常处理器会把它翻译成统一的 Result 响应。
      */
     public User login(String username, String password) {
         User user = lambdaQuery().eq(User::getName, username).one();
         if (user == null || !user.getPassword().equals(password)) {
             // 不区分"用户不存在"和"密码错误"，避免暴露哪些用户名已注册
-            throw new ResponseStatusException(HttpStatus.UNAUTHORIZED, "用户名或密码错误");
+            throw new BusinessException(ResultCode.UNAUTHORIZED, "用户名或密码错误");
         }
         return user;
     }
@@ -49,11 +49,11 @@ public class UserService extends ServiceImpl<UserMapper, User> {
     public void deduct(Long id, BigDecimal amount) {
         User user = getById(id);
         if (user == null) {
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST, "用户不存在：" + id);
+            throw new BusinessException("用户不存在：" + id);
         }
         if (user.getBalance() == null || user.getBalance().compareTo(amount) < 0) {
-            // 业务失败：异常返回给 order-service 后同样会触发全局回滚
-            throw new ResponseStatusException(HttpStatus.BAD_REQUEST,
+            // 业务失败（HTTP 400）经 Feign 传回 order-service，fallback 继续抛出触发全局回滚
+            throw new BusinessException(
                     "余额不足：当前 " + user.getBalance() + "，尝试扣减 " + amount);
         }
         user.setBalance(user.getBalance().subtract(amount));

@@ -1,5 +1,6 @@
 package com.study.cloud.order.client;
 
+import com.study.cloud.common.result.Result;
 import com.study.cloud.order.dto.UserDto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -14,7 +15,7 @@ import org.springframework.stereotype.Component;
  * 从而让 order-service 不至于跟着崩溃。
  *
  * 用 FallbackFactory 而非直接写 fallback 类的好处：
- *   能拿到 cause（失败原因），可以打日志区分是超时还是连接拒绝。
+ * 能拿到 cause（失败原因），可以打日志区分是超时还是连接拒绝。
  */
 @Component
 public class UserClientFallbackFactory implements FallbackFactory<UserClient> {
@@ -28,17 +29,16 @@ public class UserClientFallbackFactory implements FallbackFactory<UserClient> {
 
         return new UserClient() {
             /**
-             * 兜底逻辑：返回一个"降级用户"对象。
+             * 兜底逻辑：包装成成功 Result 返回一个"降级用户"对象。
              * 真实项目里可能是：查本地缓存、返回默认值、抛业务异常等。
              */
             @Override
-            public UserDto getUser(Long id) {
-                return new UserDto(
+            public Result<UserDto> getUser(Long id) {
+                return Result.success(new UserDto(
                         id,
                         "降级用户",
                         "fallback@example.com",
-                        "来自降级兜底（user-service 不可用）"
-                );
+                        "来自降级兜底（user-service 不可用）"));
             }
 
             /**

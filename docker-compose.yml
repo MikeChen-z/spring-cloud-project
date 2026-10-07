@@ -10,6 +10,14 @@ services:
     container_name: mysql
     environment:
       MYSQL_ROOT_PASSWORD: "123456"
+    # MySQL 8 默认 performance_schema + mysqlx 插件会常驻吃掉数百 MB，学习环境都用不到：
+    #   --performance-schema=OFF  关闭性能采集库（省 200~400MB）
+    #   --mysqlx=0                关闭 X Protocol 插件（33060 端口那套，本项目没用）
+    #   --innodb-buffer-pool-size 数据缓冲池，学习数据量极小，128M 足够（默认也是 128M，显式写清）
+    command:
+      - --performance-schema=OFF
+      - --mysqlx=0
+      - --innodb-buffer-pool-size=128M
     ports:
       - "3306:3306"
     volumes:
@@ -17,6 +25,7 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 512m
 
   redis:
     image: redis:7.4
@@ -28,6 +37,7 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 64m
 
   nacos:
     image: nacos/nacos-server:v2.4.0
@@ -35,9 +45,12 @@ services:
     environment:
       MODE: standalone
       NACOS_AUTH_ENABLE: "false"
-      JVM_XMS: 256m
-      JVM_XMX: 512m
-      JVM_XMN: 128m
+      # JVM 堆从 256/512 压到 128/256；Metaspace 同步收窄（JVM_MS 初始/JVM_MMS 上限）
+      JVM_XMS: 128m
+      JVM_XMX: 256m
+      JVM_XMN: 96m
+      JVM_MS: 64m
+      JVM_MMS: 192m
     ports:
       - "8848:8848"
       - "9848:9848"
@@ -46,18 +59,22 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    # nacos 堆 256m 但 RSS 含较多非堆/缓存，实测稳态约 500MiB，给到 640m 留余量
+    mem_limit: 640m
 
   namesrv:
     image: apache/rocketmq:4.9.7
     container_name: namesrv
     command: sh mqnamesrv
     environment:
-      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
+      # NameServer 只做路由注册，极轻量，128m 堆足够（原来 256m）
+      JAVA_OPT_EXT: "-Xms128m -Xmx128m -Xmn64m"
     ports:
       - "9876:9876"
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 256m
 
   broker:
     image: apache/rocketmq:4.9.7
@@ -66,7 +83,8 @@ services:
     user: root
     command: sh mqbroker -c /home/rocketmq/rocketmq-4.9.7/conf/broker.conf
     environment:
-      JAVA_OPT_EXT: "-Xms512m -Xmx512m -Xmn256m"
+      # Broker 堆从 512m 压到 256m：学习环境消息量极小，不影响功能
+      JAVA_OPT_EXT: "-Xms256m -Xmx256m -Xmn128m"
     ports:
       - "10909:10909"
       - "10911:10911"
@@ -79,14 +97,16 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 512m
 
   seata:
     image: seataio/seata-server:2.0.0
     container_name: seata
     environment:
-      JVM_XMS: 512m
-      JVM_XMX: 512m
-      JVM_MaxDirectMemorySize: 256m
+      # TC 协调器学习压力极小，堆 512m → 128/256；直接内存（Netty 用）同步减半
+      JVM_XMS: 128m
+      JVM_XMX: 256m
+      JVM_MaxDirectMemorySize: 128m
       TZ: Asia/Shanghai
     ports:
       - "8091:8091"
@@ -99,15 +119,20 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 512m
 
   zipkin:
     image: openzipkin/zipkin:3
     container_name: zipkin
+    environment:
+      # Zipkin 镜像支持 JAVA_OPTS 透传，堆压到 256m
+      JAVA_OPTS: "-Xms128m -Xmx256m"
     ports:
       - "9411:9411"
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 384m
 
   # ========== 微服务 ==========
 
@@ -131,6 +156,7 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 512m
 
   order-service:
     image: order-service:1.0.0
@@ -152,6 +178,8 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    # order 最重（Xmx384 + Metaspace256 + 线程栈/直接内存），容器上限留到 700m 防 OOMKilled
+    mem_limit: 700m
 
   gateway-service:
     image: gateway-service:1.0.0
@@ -168,6 +196,7 @@ services:
     networks:
       - study-net
     restart: unless-stopped
+    mem_limit: 512m
 
 # ========== 网络与数据卷 ==========
 networks:

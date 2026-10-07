@@ -839,23 +839,92 @@ volumes:
 
 微服务首次启动时 MySQL/Nacos 可能还没准备好，导致崩溃。靠 `restart: unless-stopped` 自动重试解决。
 
-### 12.8 全链路验证
+### 12.8 全链路验证（一键脚本）
+
+统一返回体改造后，推荐直接跑自动化脚本，覆盖 19 项断言（登录 / 参数校验 / 网关鉴权 / Seata 提交与回滚 / RocketMQ 普通消息+事务消息 / Redis 缓存），全部基于数据库前后差值校验，可重复执行：
 
 ```powershell
-# 1. 登录（网关 9000 转发到 user-service）
-curl -X POST http://localhost:9000/api/login -H "Content-Type: application/json" `
-  -d '{"username":"zhangsan","password":"123456"}'
-
-# 2. 正常下单（Seata AT 提交：扣余额 + 建订单）
-curl -X POST "http://localhost:9000/api/orders/seata/create?userId=1&amount=100" `
-  -H "Authorization: Bearer <token>"
-
-# 3. forceFail 下单（Seata AT 回滚：余额不扣、订单不建）
-curl -X POST "http://localhost:9000/api/orders/seata/create?userId=1&amount=100&forceFail=true" `
-  -H "Authorization: Bearer <token>"
-
-# 4. RocketMQ 事务消息（积分异步 +100）
-# 5. Redis 缓存（GET /api/orders/1 两次，第二次命中 orderCache::users::1）
+.\verify-full-chain.ps1        # 全绿退出码 0，有失败非 0（可接入 CI）
 ```
 
-验证通过标准：登录返回 token、正常下单余额扣减、forceFail 后余额不变、积分增加、Redis 有缓存 key。
+也可在 Postman 导入 `docker/backup/Spring-Cloud-FullChain.postman_collection.json`，用 Collection Runner 顺序执行 14 个请求（登录 Tests 自动提取 `data.token` 存入集合变量，无需手动复制）。
+
+手动验证的关键请求（经网关 9000）：
+
+```powershell
+# 1. 登录（账号是中文"张三"；成功返回 {code:200,data:{token,...}}）
+curl.exe -X POST http://localhost:9000/api/login -H "Content-Type: application/json" `
+  --data-raw '{"username":"张三","password":"123456"}'
+
+# 2. 正常下单（Seata AT 提交：扣余额 + 建订单 + afterCommit 普通消息加积分）
+curl.exe -X POST "http://localhost:9000/api/orders/seata/create?userId=1&amount=100" `
+  -H "Authorization: Bearer <token>"
+
+# 3. forceFail 下单（Seata AT 回滚：HTTP 500，余额/订单/积分均不变）
+curl.exe -X POST "http://localhost:9000/api/orders/seata/create?userId=1&amount=100&forceFail=true" `
+  -H "Authorization: Bearer <token>"
+
+# 4. RocketMQ 事务消息（约 10~20 秒 Broker 回查确认后积分 +50）
+curl.exe -X POST "http://localhost:9000/api/orders/rocketmq/create?userId=1&amount=50" `
+  -H "Authorization: Bearer <token>"
+
+# 5. Redis 缓存（GET /api/orders/1 两次，Redis 出现 key: orderCache::users::1）
+```
+
+### 12.9 工程规范：common 模块 + 统一返回体
+
+容器化之后抽了一个共享模块 `common`，把两个业务服务重复的返回格式与异常处理收敛到一处：
+
+```
+common/src/main/java/com/study/cloud/common/
+├── result/Result.java            统一返回体 {code, message, data}
+│                                 Result.success(data) / Result.fail(code, msg)
+├── result/ResultCode.java        状态码枚举（200/400/401/500）
+├── exception/BusinessException.java  业务异常（携带 code，构造方法用 this(...) 链式复用）
+└── web/GlobalExceptionHandler.java   @RestControllerAdvice 全局异常处理
+```
+
+核心约定：
+
+1. **所有接口返回 `Result<T>`**，前端只解析一种 JSON 结构；`T` 是泛型，登录装 `Map`、查询装实体、无数据装 `Void`。
+2. **HTTP 状态码与业务 code 同步设置**：业务失败必须由全局处理器用 `ResponseEntity.status(4xx/5xx)` 返回真实 HTTP 状态码，而不是直接 `return Result.fail(...)`（那会是 HTTP 200）。这一点是 Seata 回滚的前提——Feign 靠 HTTP 4xx/5xx 判定远程失败并抛异常，全局事务才会回滚。
+3. **异常归类**：
+   - `BusinessException` → 按其 code 返回（401 登录失败、400 余额不足、500 forceFail）
+   - `MethodArgumentNotValidException`（`@Valid` body 校验）→ 400
+   - `ConstraintViolationException`（`@Validated` 参数校验）→ 400
+   - `MissingServletRequestParameterException`（必填参数缺失）→ 400
+   - `MethodArgumentTypeMismatchException`（参数类型不匹配）→ 400
+   - 其余 `Exception` → 500 兜底，消息统一"系统繁忙，请稍后再试"，堆栈只打日志不外泄
+4. Feign 接口同步返回 `Result<UserDto>`，调用方先判 `code` 再取 `data`；降级工厂保持不变。
+
+### 12.10 内存优化（5.1GB → 2.9GB）
+
+10 个容器全起后 WSL2 占用约 5GB。学习环境数据量极小，按"JVM 堆 + cgroup limit 两层收敛、中间件用各自的内存旋钮"原则调优，实测降到约 2.9GB 且无 OOM：
+
+| 容器 | 优化前 | 优化后 | 手段 |
+|---|---|---|---|
+| mysql | 574 MB | ~140 MB | `--performance-schema=OFF --mysqlx=0`，buffer-pool 128M |
+| order-service | 975 MB | ~430 MB | `-Xms128m -Xmx384m -XX:MaxMetaspaceSize=256m` |
+| user/gateway | 533/497 MB | ~370/360 MB | `-Xms128m -Xmx256m -XX:MaxMetaspaceSize=256m` |
+| broker | 694 MB | ~440 MB | `JAVA_OPT_EXT` 堆 512→256m |
+| nacos | 662 MB | ~500 MB | `JVM_XMS/XMX` 128/256m |
+| seata | 597 MB | ~390 MB | `JVM_XMS/XMX` 128/256m，直接内存 128m |
+| namesrv / zipkin | 158/287 MB | ~125/200 MB | 堆压到 128m / 128-256m |
+
+每个服务另加 `mem_limit` 作为 cgroup 硬上限（JVM 堆 < 容器 limit，防 OOMKilled）。
+
+**WSL2 全局**：新建 `C:\Users\<用户>\.wslconfig`：
+
+```ini
+[wsl2]
+memory=5GB
+swap=2GB
+autoMemoryReclaim=gradual
+```
+
+要点：
+
+- `-Xms` 是初始堆，写大了 JVM 启动即全额认领；学习环境给小初始堆 + 合理上限即可。
+- JVM 实际常驻 ≈ 堆 + Metaspace + 线程栈 + 直接内存，通常是堆的 1.5~2 倍，所以 `mem_limit` 不能只按 `-Xmx` 设。
+- WSL2 借走的内存默认不主动归还 Windows（只涨不跌是正常现象，非泄漏）；改 `.wslconfig` 后需 `wsl --shutdown` 完全重启才生效。
+- ⚠️ Windows PowerShell 5.1 执行带中文的脚本/请求有两个编码坑：① `.ps1` 含中文须保存为 **带 BOM 的 UTF-8**，否则按 GBK 解析导致语法错误；② `Invoke-RestMethod` 发中文 body 要显式 `[Text.Encoding]::UTF8.GetBytes(...)`。脚本中均已处理。

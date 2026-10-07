@@ -32,6 +32,8 @@
     </properties>
 
     <modules>
+        <!-- common 是纯 jar 基础件，放在最前；reactor 也会自动按依赖顺序构建 -->
+        <module>common</module>
         <module>user-service</module>
         <module>order-service</module>
         <module>gateway-service</module>

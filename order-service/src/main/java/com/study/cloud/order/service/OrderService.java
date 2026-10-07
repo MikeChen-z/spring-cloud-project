@@ -1,5 +1,7 @@
 package com.study.cloud.order.service;
 
+import com.study.cloud.common.exception.BusinessException;
+import com.study.cloud.common.result.Result;
 import com.study.cloud.order.client.UserClient;
 import com.study.cloud.order.dto.OrderMessage;
 import com.study.cloud.order.dto.UserDto;
@@ -47,7 +49,13 @@ public class OrderService {
     @Cacheable(value = "users", unless = "#result != null and #result.source() != null and #result.source().startsWith('来自降级兜底')")
     public UserDto getUserWithCache(Long id) {
         log.info("缓存未命中，发起 Feign 调用查 user id={}", id);
-        return userClient.getUser(id);
+        // Feign 拿到统一返回体，先判 code 再取 data；业务失败转抛业务异常
+        Result<UserDto> resp = userClient.getUser(id);
+        if (resp == null || !resp.isSuccess() || resp.getData() == null) {
+            String reason = resp == null ? "user-service 返回为空" : resp.getMessage();
+            throw new BusinessException("查询用户失败：" + reason);
+        }
+        return resp.getData();
     }
 
     /**
