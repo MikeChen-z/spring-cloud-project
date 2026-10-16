@@ -20,16 +20,16 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: '镜像 tag（默认 1.0.0，回滚时填历史 tag）'
-        required: false
-        default: '1.0.0'
+        # 必填且无默认值：杜绝"忘填就部署了旧版 1.0.0"的事故
+        description: '镜像 tag = CI 构建时的 commit 完整哈希（git log / GitHub commit 页 / ACR 控制台可查；回滚就填历史哈希）'
+        required: true
         type: string
 
 env:
   COMPOSE_PROJECT_NAME: spring-cloud-study
   ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
   ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'spring-cloud-study' }}
-  IMAGE_TAG: ${{ inputs.image_tag || '1.0.0' }}
+  IMAGE_TAG: ${{ inputs.image_tag }}
 
 jobs:
   deploy:

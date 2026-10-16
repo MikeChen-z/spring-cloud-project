@@ -29,7 +29,8 @@ on:
 env:
   ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
   ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'spring-cloud-study' }}
-  IMAGE_TAG: '1.0.0'
+  # 不可变 tag：每次 push 用 commit 完整哈希，同名 tag 永不覆盖，ACR 里天然保留全部历史版本
+  IMAGE_TAG: ${{ github.sha }}
 
 jobs:
   build-test-push:

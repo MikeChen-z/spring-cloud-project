@@ -1718,7 +1718,7 @@ push 到 master
    → docker build × 3 → docker push × 3
    │
    ▼
-② 阿里云 ACR（镜像仓库，三个仓库各一个 1.0.0 tag）
+② 阿里云 ACR（镜像仓库，每次 CI 推一个以 commit 哈希命名的不可变 tag，历史版本全保留）
    │
    ▼
 ③ CD（本机 self-hosted runner，手动 Run workflow）
@@ -1766,12 +1766,14 @@ env:
 
 只支持**手动触发**（Actions 页面 → Run workflow）：学习期不自动部署，避免往 master 一 push 就把本机正在跑的一套容器全换掉。
 
+触发时**必填** `image_tag`（无默认值，防止"忘填就部署了旧版"）。tag = CI 构建时的 commit 完整哈希，三处任取：`git log -1 --format=%H`、GitHub 仓库 commit 列表、ACR 控制台镜像版本列表。**回滚 = 填历史 commit 哈希再跑一次 CD**。
+
 部署覆盖文件只写 image，其余键全部继承根 compose（多 `-f` 合并时后面的覆盖标量、未写的键一律沿用）：
 
 ```yaml
 services:
   user-service:
-    image: "${ACR_REGISTRY:?请先设置环境变量 ACR_REGISTRY}/${ACR_NAMESPACE:?...}/user-service:1.0.0"
+    image: "${ACR_REGISTRY:?请先设置环境变量 ACR_REGISTRY}/${ACR_NAMESPACE:?...}/user-service:${IMAGE_TAG:?请先设置环境变量 IMAGE_TAG}"
 ```
 
 **为什么不开一刀直接改根 `docker-compose.yml`**：根文件里的 `image: user-service:1.0.0` 是 12.2 节本机开发流程（`docker build` + `up`）依赖的，改成 ACR 地址会让本机开发也必须先 `docker login` 再 `pull`。覆盖文件把"本地开发"和"从仓库部署"两条路彻底分开。
@@ -1782,7 +1784,7 @@ services:
 # 只拉这三个（不带 --include-deps，不会去动 mysql/nacos 那堆基础设施镜像）
 docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull user-service order-service gateway-service
 
-# 重建（tag 是可变 tag，用 --force-recreate 兜底确保真换了镜像）
+# 重建（--force-recreate 兜底：确保真按新拉的镜像重建容器，而不是复用旧容器）
 docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --force-recreate user-service order-service gateway-service
 ```
 
@@ -1839,7 +1841,7 @@ mvn -B -pl order-service -am test
 # ② 亲眼确认闸门有效：把断言里的 42 改成 43，再跑一次 → 本地变红
 #    CI 上同理变红。改回来即可。（这是本章最直观的收获）
 
-# ③ CI：push 后在 Actions 页面看到 job 绿，ACR 控制台三个仓库各出现 1.0.0
+# ③ CI：push 后在 Actions 页面看到 job 绿，ACR 控制台三个仓库各出现一个以 commit 哈希命名的 tag
 
 # ④ CD：先确认 runner 在线（run.cmd 在跑）、Docker Desktop 已启动
 #    再在 Actions 页面手动 Run workflow → 日志里应出现容器 Recreated、探针通过
@@ -1856,14 +1858,13 @@ POST http://localhost:9000/api/login               # {"username":"张三","passw
 - **`COMPOSE_PROJECT_NAME` 必须固定为 `spring-cloud-study`**（本章最坑的一个）。compose 的项目名默认取**当前目录名**，而 runner 的目录名 = GitHub 仓库名。名字对不上就会起出**第二套容器**，旧容器还占着 9000 端口，新网关直接起不来。本机 `docker compose ls` 实测现有项目名就是 `spring-cloud-study`，所以部署 job 里显式钉死它。
 - **`target/` 被 `.gitignore` 忽略**：CI checkout 后没有 jar，所以 `mvn package` 必须排在 `docker build` 前面，不能只 build 不编译。
 - **绝对不要加 `.dockerignore` 把 `target/` 排除掉**：Dockerfile 的 `COPY target/xxx.jar` 会直接构建失败。当前项目没有 `.dockerignore` 就是正确状态。
-- **固定 tag `1.0.0` 是可变的**：ACR 上同名 tag 会被覆盖，因此部署时必须 `--force-recreate`，且**不具备回滚能力**——想回滚只能把代码改回去再走一次 CI（这是本章确认过的取舍）。
+- **不可变 tag 取代固定 tag `1.0.0`**（本章后期升级）：早期 CI 固定推 `1.0.0`，ACR 上同名 tag 互相覆盖，无法回滚。现已改为 `IMAGE_TAG: ${{ github.sha }}`（ci.yml），每次 push 的镜像 tag = commit 完整哈希，永不覆盖、历史版本天然保留；CD 的 `image_tag` 输入同步改为**必填无默认值**，部署/回滚都是填一个 commit 哈希。
 - **PR 事件不推镜像**：fork 的 PR 拿不到 Secrets，登录 ACR 必然失败，所以推流步骤加了 `if: github.event_name != 'pull_request'`。
 - **action 主版本号**：workflow 里用的是查证过的最新主版本（`checkout@v6` / `setup-java@v5` / `login-action@v4`）。如果首次运行报 "unable to resolve action"，把该 action 降一个大版本（v4/v3）即可，语法完全不变。
 - **GitHub 托管 runner 没有本地 Maven 镜像加速**：第一次构建约 3~6 分钟，靠 `cache: maven` 缓存 `~/.m2` 缓解。
 
 ### 22.8 生产建议
 
-- **改成不可变 tag**：CI 同时打 `1.0.0` + `sha-<短哈希>`，部署时用 sha tag，`workflow_dispatch` 加一个 `image_tag` 输入，回滚就是填一个历史 tag 重跑 CD。
 - **把 E2E 验证纳入 CD**：本章刻意把 `scripts/verify-full-chain.ps1` 留在 CI 之外（CI 里没有 Nacos/MySQL/RocketMQ，跑不起来）；生产环境可以把 E2E 放到部署后的 CD 阶段，失败自动回滚。
 - **接 Alertmanager**：第二十一章遗留项，告警目前只在 Prometheus `/alerts` 页面可见，生产需要 webhook/邮件/电话通知。
 - **多环境**：用 GitHub Environments + 各自的 Secrets/Variables 区分 dev/staging/prod，部署 job 加 `environment:` 与人工审批。
