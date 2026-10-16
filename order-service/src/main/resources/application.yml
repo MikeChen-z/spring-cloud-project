@@ -8,11 +8,10 @@ spring:
     nacos:
       discovery:
         server-addr: ${NACOS_ADDR:127.0.0.1:8848}
-    # Sentinel 控制台地址（不装 Dashboard 也能用 fallback，只是看不到可视化规则）
-    # 学习阶段先不装 Dashboard，注释掉也不影响降级功能
+    # Sentinel 控制台地址：Dashboard 可视化管理流控/熔断规则 + 实时监控
     sentinel:
       transport:
-        dashboard: 127.0.0.1:8858
+        dashboard: ${SENTINEL_DASHBOARD:127.0.0.1:8858}
       # 规则持久化：从 Nacos 拉取流控规则，启动自动加载、发布即更新
       datasource:
         flow:
@@ -98,6 +97,13 @@ seata:
   enable-auto-data-source-proxy: true
 
 management:
+  # 给所有 Micrometer 指标统一打 application 标签，Grafana 可按服务筛选聚合
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
   endpoints:
     web:
       exposure:

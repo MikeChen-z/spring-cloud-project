@@ -40,6 +40,9 @@ public class User {
     /** 用户积分（RocketMQ 演示：消费订单消息累加） */
     private Integer points;
 
+    /** 角色（ADMIN管理员/USER普通用户），用于 RBAC 权限控制 */
+    private String role;
+
     /** 标识数据来源，不入库（供下游调试看是从哪个服务返回的） */
     @TableField(exist = false)
     private String source;

@@ -1,0 +1,40 @@
+# Prometheus 抓取配置
+# 学习环境：15s 抓取一次；所有目标在 study-net 网络内以服务名互通
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  # 外部标签：写入每个时序，便于区分环境
+  external_labels:
+    environment: study
+
+# 告警规则：每 evaluation_interval（15s）评估一次；状态在 /alerts 页面可见
+rule_files:
+  - "alerts.yml"
+
+scrape_configs:
+  # Prometheus 自监控
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 网关服务（单实例，有 container_name，静态地址即可）
+  - job_name: gateway-service
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["gateway-service:9000"]
+
+  # 用户服务：--scale 可起多副本，用 dns_sd 的 A 记录返回所有副本 IP
+  - job_name: user-service
+    metrics_path: /actuator/prometheus
+    dns_sd_configs:
+      - names: ["user-service"]
+        type: A
+        port: 8081
+
+  # 订单服务：同样支持多副本自动发现
+  - job_name: order-service
+    metrics_path: /actuator/prometheus
+    dns_sd_configs:
+      - names: ["order-service"]
+        type: A
+        port: 8082

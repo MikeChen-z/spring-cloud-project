@@ -27,3 +27,6 @@ Thumbs.db
 
 # ===== Redis 本地持久化文件 =====
 dump.rdb
+
+# ===== AI 辅助工具目录（Trae 生成的文档与 skill 配置，不入库） =====
+.trae/

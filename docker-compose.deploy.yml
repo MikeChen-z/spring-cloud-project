@@ -1,0 +1,28 @@
+# 部署覆盖文件：只把三个微服务的 image 指向阿里云 ACR，其余键全部继承根 docker-compose.yml
+#
+# 用法（在仓库根目录）：
+#   $env:ACR_REGISTRY  = 'registry.cn-hangzhou.aliyuncs.com'
+#   $env:ACR_NAMESPACE = 'spring-cloud-study'
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull user-service order-service gateway-service
+#   docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --force-recreate user-service order-service gateway-service
+#
+# 为什么单独开一个文件，而不是直接把根 docker-compose.yml 里的 image 改成 ACR 地址：
+#   根文件里的 `image: user-service:1.0.0` 是本机开发流程（README 12.2：docker build + up）依赖的，
+#   改成 ACR 地址后本机开发也必须先 docker login 再 pull。
+#   多 -f 合并时「后面的覆盖标量、未写的键全部继承」，
+#   所以这里只写 image，environment / ports / depends_on / networks / restart / mem_limit / volumes 全部沿用根文件。
+#
+# ${VAR:?提示} 是 compose 的必填插值：环境变量没设就直接报错并打印提示，避免拼出半截镜像地址。
+#
+# 注意：前提是 COMPOSE_PROJECT_NAME 与根 compose 所在目录推出来的项目名一致
+#（本机实测为 spring-cloud-study），否则会起出第二套容器并抢 9000 端口。
+
+services:
+  user-service:
+    image: "${ACR_REGISTRY:?请先设置环境变量 ACR_REGISTRY}/${ACR_NAMESPACE:?请先设置环境变量 ACR_NAMESPACE}/user-service:1.0.0"
+
+  order-service:
+    image: "${ACR_REGISTRY:?请先设置环境变量 ACR_REGISTRY}/${ACR_NAMESPACE:?请先设置环境变量 ACR_NAMESPACE}/order-service:1.0.0"
+
+  gateway-service:
+    image: "${ACR_REGISTRY:?请先设置环境变量 ACR_REGISTRY}/${ACR_NAMESPACE:?请先设置环境变量 ACR_NAMESPACE}/gateway-service:1.0.0"

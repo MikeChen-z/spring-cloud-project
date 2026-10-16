@@ -18,8 +18,11 @@
 | JJWT | 0.12.6 |
 | Caffeine / Redis | Caffeine 本地缓存 + Redis 分布式缓存 |
 | Sentinel | 1.8.8（流控/熔断，核心在依赖中） |
-| Sentinel Dashboard | 1.8.8（独立控制台，:8858，可选可视化） |
+| Sentinel Dashboard | 1.8.8（容器化控制台，:8858，账号/密码均 sentinel） |
 | Micrometer Tracing + Zipkin | 全链路追踪 |
+| Micrometer + Prometheus | v2.54.1（指标采集，:9090） |
+| Grafana | 11.2.0（可视化面板，:3000，admin/admin123） |
+| JMeter | 5.6.3（CLI 压测，四轮场景实测） |
 | Seata | 2.0.0（AT 模式分布式事务，TC 端须用 JRE 8 启动） |
 | RocketMQ | 4.9.7（NameServer :9876 / Broker :10911） |
 | rocketmq-spring-boot-starter | 2.3.0（Spring Boot 3 兼容版） |
@@ -60,6 +63,8 @@
 
 基础设施：Nacos :8848 ｜ MySQL :3306 ｜ Redis :6379 ｜ Zipkin :9411
           Sentinel Dashboard :8858 ｜ Seata TC :8091/:7091 ｜ RocketMQ :9876/:10911
+可观测性：Prometheus :9090（抓 3 个微服务 /actuator/prometheus）
+          Grafana :3000（Prometheus 数据源自动注入，QPS/P95/429/熔断面板）
 ```
 
 ## 三、模块说明
@@ -72,6 +77,7 @@
 | `sql/init.sql` | — | 基础库表 + 初始用户数据 |
 | `sql/seata_demo.sql` | — | order_db.t_order 建表；t_user 增加 balance 字段 |
 | `sql/rocketmq_demo.sql` | — | t_user 增加 points 字段 |
+| `sql/dlq_demo.sql` | — | order_db.t_dead_letter 死信记录表（可见 + 可补偿） |
 
 ## 四、启动顺序
 
@@ -87,6 +93,7 @@ startup.cmd -m standalone
 #   (3) 业务库 undo_log 快照表：    D:\seata\script\client\at\db\mysql.sql → order_db、study_cloud 各执行一次
 #   (4) sql/seata_demo.sql        t_order 表 + t_user.balance
 #   (5) sql/rocketmq_demo.sql     t_user.points
+#   (6) sql/dlq_demo.sql          order_db.t_dead_letter 死信记录表
 mysql -u root -p < sql/init.sql
 
 # Redis：默认 6379 端口
@@ -96,6 +103,10 @@ java "-Dserver.port=8858" -jar sentinel-dashboard-1.8.8.jar
 
 # 可选：Zipkin 链路追踪
 java -jar zipkin-server.jar
+
+# 可选：Prometheus + Grafana（可观测性，详见十五章）
+#   本机手动方式较繁琐，推荐直接用 Docker Compose（见 12.2 / 十五章），
+#   compose 已含 prometheus/grafana 容器 + 自动注入数据源，up 即开箱可用
 
 # Seata TC（必须用 JRE 8：jraft 1.3.x 与 JDK21 不兼容；-h 固定本机 IP 防多网卡误绑）
 D:\seata\start-seata-jre8.bat
@@ -142,8 +153,12 @@ java -jar gateway-service/target/gateway-service-1.0.0.jar
 | 5 | `POST /api/orders` | 需要 Token | 创建订单（写接口），用于演示关联流控模式 |
 | 6 | `GET /api/orders/fail` | 需要 Token | 稳定报错接口，用于演示异常比例熔断 |
 | 7 | `GET /api/orders/slow` | 需要 Token | 慢响应接口（~300ms），用于演示慢调用比例熔断 |
-| 8 | `POST /api/orders/seata/create` | 直连 8082 测试 | Seata AT 下单：写订单 + 扣余额 + 发积分消息；`forceFail=true` 演示全局回滚 |
+| 8 | `POST /api/orders/seata/create` | 直连 8082 测试 | Seata AT 下单：写订单 + 扣余额 + 发积分消息；`forceFail=true` 演示全局回滚；提交成功后自动发一条 10s 延迟消息做超时取消检查（见 19.2） |
 | 9 | `POST /api/orders/rocketmq/create` | 直连 8082 测试 | RocketMQ 事务消息下单；`forceUnknown=true` 演示 Broker 事务回查 |
+| 10 | `POST /api/orders/status-demo` | 需要 Token | 顺序消息演示：按 `orderId` 保序连发 6 条状态消息；`failStep` 模拟消费失败挂起队列（见 19.1） |
+| 11 | `POST /api/orders/backlog-demo` | 需要 Token | 消息积压演示：`sendOneWay` 瞬时灌入 `count` 条慢消费消息（见 19.3）；`sleepMs=-1` 即"毒消息"，用于演示死信（见 20） |
+| 12 | `GET /api/orders/dlq/list` | 需要 Token | 死信查询：`status`（0 待补偿 / 1 补偿成功）可选，返回死信记录含原始报文（见 20） |
+| 13 | `POST /api/orders/dlq/retry` | 需要 Token | 死信补偿重投：读待补偿死信 → 修复 → 重投原 Topic，消费成功后回写 `status=1`（见 20） |
 
 > 接口 8/9 学习阶段直连 `http://localhost:8082` 调用（网关 JWT 不影响这两条链路）：
 > `POST http://localhost:8082/orders/seata/create?userId=1&amount=10`
@@ -164,6 +179,10 @@ Postman 推荐用法：登录接口 Tests 写 `pm.environment.set("token", pm.re
 10. **Seata 正常提交**：调 `/orders/seata/create`，t_order 新增订单、t_user.balance 减少、points 增加（消息异步）
 11. **Seata 异常回滚**：加 `forceFail=true`，订单与余额改动全部回滚（undo_log 生效）；自增 ID 不回退属正常现象
 12. **RocketMQ 事务消息**：普通提交后积分增加；`forceUnknown=true` 时积分不变，约 50~60s 后 Broker 回查返回 COMMIT，积分才增加（详见第十章）
+13. **顺序消息**：`/orders/status-demo?orderId=301` 连发 6 条状态消息，order-service 日志中同订单 step 严格 1→6 递增（详见 19.1）
+14. **延迟消息**：下单后 10s 未支付自动取消（CAS 条件更新）；先支付则取消落空（详见 19.2）
+15. **消息积压**：`/orders/backlog-demo` 灌入后 `mqadmin consumerProgress` 看 Diff Total 冲高回落（详见 19.3）
+16. **死信队列闭环**：`/orders/backlog-demo?count=3&sleepMs=-1` 灌毒消息，约 45s 后自动进 `%DLQ%order-backlog-consumer-group` 并落库 `t_dead_letter`；调 `/orders/dlq/retry` 修复重投后 `status` 回写为 1（一键脚本 `dlq-test.ps1`，详见 20）
 
 > 测降级前先清缓存：`del orderCache::users::1`，否则缓存命中不会发出 Feign 请求，降级被缓存"掩盖"。
 
@@ -685,7 +704,7 @@ afterCommit 发送（不回滚的消息才出门）
 
 ### 12.1 服务清单
 
-10 个服务全部跑在 `study-net` 自定义桥接网络内，通过**服务名**互相访问。
+13 个服务全部跑在 `study-net` 自定义桥接网络内，通过**服务名**互相访问。
 
 | 服务 | 镜像 | 端口 | 数据卷 | 说明 |
 |------|------|------|--------|------|
@@ -695,7 +714,10 @@ afterCommit 发送（不回滚的消息才出门）
 | namesrv | apache/rocketmq:4.9.7 | 9876 | - | RocketMQ 路由中心 |
 | broker | apache/rocketmq:4.9.7 | 10911, 10909 | rocketmq-store, rocketmq-logs | 消息存储中转 |
 | seata | seataio/seata-server:2.0.0 | 8091, 7091 | -（挂载 application.yml） | 分布式事务 TC |
-| zipkin | openzipkin/zipkin:3 | 9411 | - | 链路追踪（可选） |
+| zipkin | openzipkin/zipkin:3 | 9411 | - | 链路追踪 |
+| prometheus | prom/prometheus:v2.54.1 | 9090 | -（挂载 prometheus.yml） | 指标采集（15s 抓取 3 微服务） |
+| grafana | grafana/grafana:11.2.0 | 3000 | grafana-data（挂载 provisioning） | 可视化面板（admin/admin123，数据源自动注入） |
+| sentinel-dashboard | bladex/sentinel-dashboard:1.8.8 | 8858 | - | Sentinel 控制台（sentinel/sentinel） |
 | user-service | user-service:1.0.0 | 8081 | - | 用户服务 |
 | order-service | order-service:1.0.0 | 8082 | - | 订单服务 |
 | gateway-service | gateway-service:1.0.0 | 9000 | - | 网关 |
@@ -841,11 +863,22 @@ volumes:
 
 ### 12.8 全链路验证（一键脚本）
 
-统一返回体改造后，推荐直接跑自动化脚本，覆盖 34 项断言（登录 / 参数校验 / 网关鉴权 / Seata 提交与回滚 / RocketMQ 普通消息+事务消息 / Redis 缓存 / 接口幂等 / 链路追踪），全部基于数据库前后差值校验；脚本开头会把测试账户重置为余额、积分各 1000，可无限次重复执行：
+统一返回体改造后，推荐直接跑自动化脚本，覆盖 58 项断言（登录 / 参数校验 / 网关鉴权 / Seata 提交与回滚 / RocketMQ 普通消息+事务消息 / Redis 缓存 / 接口幂等 / 链路追踪 / Sentinel 流控与熔断），全部基于数据库前后差值校验；脚本开头会把测试账户重置为余额、积分各 1000，可无限次重复执行：
 
 ```powershell
-.\verify-full-chain.ps1        # 全绿退出码 0，有失败非 0（可接入 CI）
+.\scripts\verify-full-chain.ps1   # 全绿退出码 0，有失败非 0（可接入 CI）
+.\scripts\cas-race-test.ps1       # 延迟消息支付/取消并发竞态测试（CAS 条件更新验证）
+.\scripts\msg-backlog.ps1         # 消息积压验证：sendOneWay 瞬时洪峰 vs 慢消费，观察 Diff Total 冲高→归零
+.\scripts\dlq-test.ps1            # 死信队列验证：毒消息 → 重试耗尽 → 死信落库 → 补偿重投 → 回写 status=1（9 项断言）
 ```
+
+消息积压监控辅助脚本：
+
+```powershell
+.\scripts\lag-pusher.ps1          # 每 15s 从 broker mqadmin 拉 Diff Total → 推送到 lag-report → Micrometer Gauge（见第二十一章）
+```
+
+脚本统一放在 `scripts/` 目录；只依赖 HTTP 与 docker exec，从任意目录运行均可。三大特性（顺序 / 延迟 / 积压）的原理与实测数据见第十九章，死信闭环见第二十章。
 
 也可在 Postman 导入 `docker/backup/Spring-Cloud-FullChain.postman_collection.json`，用 Collection Runner 顺序执行 8 个文件夹共 20 个请求（登录 Tests 自动提取 `data.token` 存入集合变量，幂等用例自动传递 `idemToken`，无需手动复制）。
 
@@ -1032,6 +1065,805 @@ curl.exe "http://localhost:9411/api/v2/trace/6ac5c755..."
 
 | 产物 | 内容 |
 |---|---|
-| `verify-full-chain.ps1` | 34 项断言，新增第 8 章幂等（9 项，含 Redis TTL/令牌删除/重复与缺失拦截/DB 差值）、第 9 章追踪（X-Trace-Id 头、serverInstance、Zipkin span 覆盖 gateway+order） |
+| `verify-full-chain.ps1` | 58 项断言，新增第 8 章幂等（9 项，含 Redis TTL/令牌删除/重复与缺失拦截/DB 差值）、第 9 章追踪（X-Trace-Id 头、serverInstance、Zipkin span 覆盖 gateway+order）、第 10~12 章网关容错（超时/重试/熔断，共 6 项） |
 | Postman 集合 | 8 个文件夹 20 个请求；新增「7. 接口幂等」「8. 分布式链路追踪」，原 Seata/RocketMQ 请求全部从直连 8082 改为经网关 9000 |
 | 新增/改动代码 | `IdempotentTokenService`、`OrderController` 幂等两端点 + `serverInstance`、common 的 `TraceIdResponseFilter` 与坏 JSON 异常归类、compose 去固定名/端口支持 scale |
+
+## 十四、网关容错三阶段：超时 → 重试 → 熔断
+
+前面阶段网关只做路由转发和鉴权，下游服务出问题时没有任何防护。这一课按"由浅入深"给网关补齐三层容错机制：**超时（基础兜底）→ 重试（瞬时故障）→ 熔断（持续故障）**，同时修复了三个此前遗留的坑。
+
+### 14.1 阶段1：网关超时控制
+
+**问题**：`order-service` 没有配置任何超时，下游接口若长时间不响应（如 `/orders/timeout` sleep 5s），网关会一直挂起，浪费连接资源。
+
+**改动**：`application.yml` 全局加 `httpclient.connect-timeout=2000` + `response-timeout=5s`，order 路由 metadata 单独设 `response-timeout=2000`（2s）。
+
+**结果**：`/orders/timeout` 返回 **504 GATEWAY_TIMEOUT**，耗时 ~2s；其余正常接口不受影响。
+
+### 14.2 阶段2：网关自动重试
+
+**问题**：下游瞬时故障（网络抖动、瞬时 503）时，调用方直接拿到错误，体验差。
+
+**改动**：order 路由加 `Retry` filter，参数：`retries=2`（首次+2=共3次）、`series=5xx`、`methods=GET`、`exceptions=[java.io.IOException]`、`backoff=指数退避(100ms→200ms)`。
+
+**安全边界**：
+- `methods=GET`：只重试幂等的 GET，POST 下单绝不能重试（会重复下单/与幂等令牌冲突）
+- `series=5xx`：下游没处理成功才重试，4xx 参数错误重试无意义
+- `exceptions` 只留 `IOException`：连接被拒（连接都没建立）才重试；**刻意不含 `TimeoutException`**——响应超时下游可能已在处理，重试会叠加成 6s
+
+**结果**：`GET /api/orders/retry-demo`（前2次503第3次成功）实测 3 次尝试后返回 200。
+
+### 14.3 阶段3：网关层熔断（CircuitBreaker）
+
+**问题**：下游持续故障（失败率≥50%）时，重试毫无意义，反而会加剧下游压力，甚至拖垮网关自身。
+
+**改动**：
+
+1. `pom.xml` 引入 `spring-cloud-starter-circuitbreaker-reactor-resilience4j`
+2. `application.yml` order 路由加 `CircuitBreaker` filter（在 `Retry` 之前 = 包裹 Retry，熔断打开时不执行重试也不打后端），配置 `fallbackUri=forward:/fallback/order` + `statusCodes=[500,503]`
+3. Resilience4j 熔断器参数：`slidingWindowSize=10`、`failureRateThreshold=50`、`waitDurationInOpenState=10s`、`permittedNumberOfCallsInHalfOpenState=3`
+4. **新增 `FallbackController`**：网关本地降级端点，从 `CIRCUITBREAKER_EXECUTION_EXCEPTION_ATTR` 取异常，4 类分类处理：
+   - `CallNotPermittedException` → 503 CIRCUIT_OPEN
+   - 超时类 → 504 RESPONSE_TIMEOUT
+   - `HttpStatusCodeException`（业务真实500/503）→ **透传原始状态码**，`fallback=false`
+   - 其它 → 503 DOWNSTREAM_ERROR
+
+**结果**：`GET /api/orders/circuit-test`（前4次200之后持续503）实测闭环：
+```
+前4次 200 → 第5-10次 503（计入熔断统计）→ 第11次起 503 fallback=true
+→ 10s 后半开探测 3 次 200 → 熔断关闭，恢复正常
+```
+
+### 14.4 顺手修复的三个坑
+
+| 坑 | 根因 | 修复 |
+|---|---|---|
+| `/orders/timeout` 返回 503/1s 而非 504/2s | Resilience4j `TimeLimiter` 默认 1s 抢在网关 `response-timeout=2s` 前触发 | 配置 `timelimiter.configs.default.timeout-duration=10s` |
+| Seata 回滚 forceFail 返回非 500 | `fallbackUri` 的 forward 保留原始 HTTP 方法，POST 到 `@GetMapping` 的 fallback 报 405 | 把 fallback 端点改为 `@RequestMapping`（不限制方法），并识别 `HttpStatusCodeException` **透传原始状态码** |
+| PowerShell 5.1 读 5xx body 为空 | `$_.Exception.Response.GetResponseStream()` 对已缓冲响应返回空流 | 改用 `$_.ErrorDetails.Message` |
+
+### 14.5 验证产物
+
+`verify-full-chain.ps1` 新增第 10~12 章共 6 条断言，全链路从 34 项 → **46 项**：
+- 第10章：超时 → 504 / 2s 内返回
+- 第11章：重试 → 3 次尝试后 200
+- 第12章：熔断闭环（CLOSED→OPEN→HALF_OPEN→CLOSED）
+
+---
+
+## 十五、Prometheus + Grafana 可观测性
+
+前面各章的限流/熔断/重试效果，之前只能靠肉眼数响应码、翻日志判断。本章接入**指标采集 + 可视化**，把 QPS、延迟分布、429 拒绝率、熔断器状态实时画成图，压测时一目了然。
+
+可观测性三大支柱：metrics（指标，本章）+ tracing（链路，见 13.3 Zipkin）+ logging（日志，未接入）。
+
+### 15.1 整体链路
+
+```
+微服务 (Micrometer)                    Prometheus                 Grafana
+/actuator/prometheus  ◄── 15s 抓取 ──  :9090 时序存储  ◄── PromQL 查询 ──  :3000 面板
+   文本格式指标                            TSDB                        Dashboard
+```
+
+- 三个微服务各加一个依赖 `micrometer-registry-prometheus`，把 JVM/HTTP 指标以 Prometheus 文本格式暴露在 `/actuator/prometheus`。
+- Prometheus 容器按 `docker/prometheus/prometheus.yml` 每 15s 抓取一次，存进自己的 TSDB。
+- Grafana 容器通过 provisioning 自动挂载 Prometheus 数据源（`docker/grafana/provisioning/datasources/datasource.yml`），启动即可查，无需手动添加。
+
+### 15.2 关键配置
+
+**1）依赖（三个微服务 pom 相同）**：
+
+```xml
+<dependency>
+    <groupId>io.micrometer</groupId>
+    <artifactId>micrometer-registry-prometheus</artifactId>
+</dependency>
+```
+
+**2）application.yml（三个微服务相同）**：给指标打 `application` 标签便于按服务筛选；开启 HTTP 请求直方图才能算 P95 分位数。
+
+```yaml
+management:
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true   # 关键：开启后才有 http_server_requests_seconds_bucket，才能 histogram_quantile 算 P95
+  endpoints:
+    web:
+      exposure:
+        include: '*'                  # 暴露 /actuator/prometheus
+```
+
+**3）Prometheus 抓取（`docker/prometheus/prometheus.yml`）**：多副本服务用 `dns_sd_configs` 的 A 记录解析自动发现所有副本 IP，不用写死容器名。
+
+```yaml
+scrape_configs:
+  - job_name: gateway-service          # 单实例有 container_name，静态地址即可
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: ["gateway-service:9000"]
+  - job_name: user-service             # --scale 多副本，dns_sd 返回所有副本
+    metrics_path: /actuator/prometheus
+    dns_sd_configs:
+      - names: ["user-service"]
+        type: A
+        port: 8081
+```
+
+**4）compose 服务**：`grafana` 挂 `./docker/grafana/provisioning` 实现数据源开箱即用，`GF_SECURITY_ADMIN_PASSWORD=admin123` 设初始密码。
+
+### 15.3 常用 PromQL 面板
+
+| 面板 | PromQL | 说明 |
+|------|--------|------|
+| 实时 QPS | `sum by (application) (rate(http_server_requests_seconds_count[1m]))` | 每秒请求数，按服务分线 |
+| P95 延迟 | `histogram_quantile(0.95, sum by (le, application) (rate(http_server_requests_seconds_bucket[5m])))` | 需先开 percentiles-histogram |
+| 429 拒绝率 | `sum(rate(http_server_requests_seconds_count{status="429"}[1m]))` | 限流生效直接可见 |
+| 熔断器状态 | `resilience4j_circuitbreaker_state{name="order-circuit-breaker"}` | 0=CLOSED 1=OPEN 2=HALF_OPEN |
+| JVM 堆占用 | `jvm_memory_used_bytes{area="heap"}` | 配合 compose mem_limit 调优 |
+
+### 15.4 踩坑
+
+- **P95 面板无数据**：只配 `percentiles`（如 `0.95: true`）得到的是客户端近似值、且 Prometheus 查不到；必须用 `percentiles-histogram: true` 生成 `_bucket` 时序，`histogram_quantile` 才有输入。
+- **多副本只抓到一个**：静态 `targets` 写服务名只解析到一个 IP；改 `dns_sd_configs` A 记录才能发现全部副本。
+- **指标里没有 application 标签**：`management.metrics.tags.application` 漏配，Grafana 无法按服务分组聚合。
+
+### 15.5 RocketMQ 消息积压告警（第二十一章实现）
+
+Prometheus 除抓取微服务基础指标（JVM、HTTP 请求、Feign 调用）外，还通过 order-service 内置的 Micrometer Gauge 监控 RocketMQ 消息积压：
+
+| 指标 | 含义 | 来源 |
+|------|------|------|
+| `rocketmq_consumer_lag{consumer_group}` | 消费组积压条数（Diff Total = BrokerOffset − ConsumerOffset） | 宿主机 `lag-pusher.ps1` 每 15s 从 broker `mqadmin consumerProgress` 拉取后推送到 `/orders/internal/lag-report` |
+| `rocketmq_dead_letter_pending` | 死信待补偿条数（`t_dead_letter WHERE status=0`） | order-service `MqLagMonitor` 定时查库 |
+
+告警规则在 `docker/prometheus/alerts.yml`：`BacklogHigh`（lag>1000 持续 1m → warning）与 `DeadLetterPending`（≥5 → critical）。告警状态在 `http://localhost:9090/alerts` 实时可见。完整实现与踩坑记录见第二十一章。
+
+---
+
+## 十六、JMeter 压测实测
+
+用 JMeter 5.6.3 CLI 模式对前面章节的限流/熔断做**定量验证**，四轮压测各有明确目标。脚本在 `jmeter/*.jmx`，结果 `jmeter/out-0*.jtl`，日志 `jmeter/jmeter-0*.log`。
+
+### 16.1 运行方式
+
+```powershell
+jmeter -n -t jmeter/01-baseline-orders.jmx -l jmeter/out-01.jtl -j jmeter/jmeter-01.log
+# -n 非 GUI 模式；-t 脚本；-l 结果文件；-j 日志
+```
+
+### 16.2 四轮结果
+
+| 轮次 | 脚本 | 目标 | 请求量 | 结果分布 | 结论 |
+|------|------|------|--------|----------|------|
+| 01 基线 | `01-baseline-orders.jmx` | 测正常链路吞吐/延迟 | 115 | 全 200 | 链路健康，作为对照组 |
+| 02 限流 | `02-ratelimit-orders.jmx` | 触发网关 Redis 令牌桶 | ~24.7 万 | 141 个 200 + 24.7 万 429 | replenishRate=2 生效，超额流量被 429 削峰 |
+| 03 熔断 | `03-circuit-fail.jmx` | 触发 Resilience4j 熔断 | ~24.3 万 | 1 个 200 + 24.3 万 429 + 15 个 500 + 125 个 503 | 失败率超阈值熔断打开，fallback 接管 |
+| 04 Sentinel 限流 | `04-sentinel-limt.jmx` | 触发 Sentinel 流控规则 | - | 部分 200 + 部分 429 | Sentinel QPS 规则生效（见十七章） |
+
+### 16.3 观察要点（配合十五章面板）
+
+- **02 限流**：Grafana「429 拒绝率」曲线在压测启动瞬间飙升，QPS 面板被压在令牌桶速率附近——证明限流在网关最外层挡住了流量，没打到下游。
+- **03 熔断**：熔断器状态面板从 0(CLOSED) 跳到 1(OPEN)，等待 10s 后转 2(HALF_OPEN) 再回 0，与 Resilience4j 配置 `waitDurationInOpenState=10s` 完全吻合。
+- **P95 延迟**：熔断打开后被拒绝的请求延迟从 ~187ms（真实 500）降到 ~10ms（fallback），P95 曲线明显下降——熔断不仅保护下游，还降低了调用方延迟。
+
+### 16.4 Windows 本机压测的坑
+
+- **PowerShell 5.1 并发出不去**：`Invoke-WebRequest` 默认每服务器仅 2 连接；改用 `System.Net.Http.HttpClient` 并设 `ServicePointManager.DefaultConnectionLimit=100`。这也是压测脚本最终用 JMeter 而非 PS 脚本的原因之一。
+- **JMeter 结果分析**：`.jtl` 是 CSV，可用 JMeter GUI「聚合报告/察看结果树」打开，或命令行 `jmeter -g out-01.jtl -o report/` 生成 HTML 报告。
+
+---
+
+## 十七、Sentinel 全栈容器化
+
+第七章的 Sentinel 是「依赖在微服务里 + Dashboard 本机 jar 单独跑」的半成品。本章把 Sentinel **完整搬进 Docker Compose**：Dashboard 容器化、三个微服务全部接入、网关层熔断从 Resilience4j 切换到 Sentinel。
+
+### 17.1 架构变化
+
+```
+之前：微服务(sentinel 依赖) ──心跳──▶ 本机 jar Dashboard :8858（手动启动）
+现在：微服务(sentinel 依赖) ──心跳──▶ sentinel-dashboard 容器 :8858（compose 一键起）
+                                        ▲ 规则下发（Dashboard → 客户端内存）
+                                        Nacos（规则持久化，重启不丢，见 7.5）
+```
+
+- Dashboard 用镜像 `bladex/sentinel-dashboard:1.8.8`（官方未发布 ARM/最新 tag，此镜像与 Spring Cloud Alibaba 2023.0.1.0 的 Sentinel 1.8.8 版本对齐）。
+- 三个微服务通过环境变量 `SENTINEL_DASHBOARD: sentinel-dashboard:8858` 指向容器地址，替代原来的 `127.0.0.1:8858`。
+
+### 17.2 接入清单
+
+| 改动 | 文件 | 内容 |
+|------|------|------|
+| Dashboard 容器 | `docker-compose.yml` | 新增 `sentinel-dashboard` 服务，映射 8858，`mem_limit: 384m` |
+| 微服务环境变量 | `docker-compose.yml` | 三服务加 `SENTINEL_DASHBOARD` + `depends_on: sentinel-dashboard` |
+| 依赖 | 三服务 `pom.xml` | `spring-cloud-starter-alibaba-sentinel` |
+| 配置 | 三服务 `application.yml` | `spring.cloud.sentinel.transport.dashboard=${SENTINEL_DASHBOARD:127.0.0.1:8858}` |
+| 网关熔断切换 | `gateway-service/application.yml` | **移除** `CircuitBreaker` filter，熔断改由 Sentinel degrade 规则接管 |
+
+### 17.3 实测：与 Resilience4j 的冲突
+
+网关加 Sentinel 依赖后**启动直接失败**：
+
+```
+java.lang.IllegalArgumentException: Unable to find GatewayFilterFactory with name CircuitBreaker
+```
+
+**根因**：路由里配的 `CircuitBreaker` filter 由 `spring-cloud-starter-circuitbreaker-reactor-resilience4j` 提供，而 Sentinel 的 WebFlux 自动配置（`SentinelWebFluxAutoConfiguration`）与 Resilience4j CircuitBreaker 的自动装配相互干扰，导致 `CircuitBreakerGatewayFilterFactory` 没注册成功——路由引用不存在的 filter，启动即挂。
+
+**结论**：网关层 Resilience4j CircuitBreaker filter 与 Sentinel **不能共存**，二选一。本项目选 Sentinel（动态规则 + Dashboard 可视化更强），从 order-service 路由移除 `CircuitBreaker` filter 后启动正常。
+
+### 17.4 Sentinel vs Resilience4j 选型对比（结合本项目实测）
+
+| 维度 | Resilience4j | Sentinel |
+|------|--------------|----------|
+| 规则管理 | 改 YAML 重启生效 | **Dashboard 动态实时下发，无需重启** |
+| 可视化 | 仅 Grafana 指标（需自己配面板） | Dashboard 自带实时监控 + 资源链路树 |
+| 规则持久化 | 配置即代码（Git 管理） | 需额外接 Nacos 数据源，否则重启丢失 |
+| 网关集成 | CircuitBreaker filter 开箱即用 | 与 Resilience4j filter 冲突，需移除其一 |
+| 流控能力 | 无（需配合网关限流） | QPS/并发/关联/链路流控一体 |
+
+### 17.5 验证
+
+- Dashboard http://localhost:8858（sentinel/sentinel）→ 机器列表出现 gateway/user/order 三个应用，全部 healthy。
+- 簇点链路自动发现资源：网关侧 `/api/orders/**`、`/api/login`；order 侧 `/orders/{id}`、Feign 资源 `GET:http://user-service/users/{id}`。
+- 流控：给 `/orders/{id}` 配 QPS=5，04 压测脚本快速打 20 请求 → 17 个 200 + 3 个 429（Sentinel 拦截）。
+- 熔断：给 `/orders/fail` 配异常比例 ≥50%、窗口 10s，压测触发后熔断打开。
+
+### 17.6 已知限制
+
+`/orders/fail` 的异常比例熔断**统计不到异常**（Dashboard 显示 `exceptionQps=0`）：Spring MVC 的 `@ExceptionHandler` 捕获异常后，`HandlerInterceptor.afterCompletion` 收到的 `ex=null`，Sentinel Web MVC adapter 无法统计。要体验完整熔断，用 Feign 级降级（`UserClientFallbackFactory`）：停掉 user-service 后 order 的 Feign 调用抛异常，Sentinel 能正确统计并触发降级。
+
+---
+
+## 十八、Loki 日志栈：补全可观测性最后一角
+
+十五章接了 metrics（Prometheus），13.3 节接了 tracing（Zipkin），本章补上 **logging**——可观测性三支柱至此闭环。
+
+### 18.1 为什么是 Loki 而不是 ELK
+
+| 维度 | ELK（ES+Logstash+Kibana+Filebeat） | Loki + Promtail |
+|------|-----------------------------------|-----------------|
+| 新增内存 | ~2GB（ES 一个就要 1g） | **~350MB**（loki 256m + promtail 128m） |
+| 索引方式 | 全文倒排索引（日志内容全建索引） | **只索引标签**，日志正文压缩存块 |
+| 查询界面 | 新增 Kibana :5601 | 复用现有 Grafana :3000 |
+| 概念模型 | 三套新组件 | 与 Prometheus 标签模型一脉相承 |
+
+本项目 WSL2 内存上限 5GB、现有容器已占 ~3.6GB，ELK 塞不下；Loki 是最优解。
+
+### 18.2 架构与数据流
+
+```
+12 个容器 stdout/stderr
+        │  （应用零侵入，不改一行代码）
+        ▼
+   Promtail :9080          ← 挂 /var/run/docker.sock，docker_sd 自动发现容器
+        │  提取标签：service / container / stream / level
+        ▼  push
+   Loki :3100              ← 只索引标签，日志正文压缩存块（TSDB + filesystem）
+        ▲  LogQL 查询
+        │
+   Grafana :3000           ← provisioning 自动注入 Loki 数据源
+```
+
+### 18.3 配置清单
+
+| 文件 | 作用 |
+|------|------|
+| `docker/loki/local-config.yaml` | Loki 单节点：TSDB 索引 + filesystem 存储 + 7 天保留（`retention_period: 168h`） |
+| `docker/promtail/config.yml` | docker_sd 采集全部容器日志，relabel 提取 service/container/stream 标签，pipeline 提取 level |
+| `docker-compose.yml` | 新增 loki/promtail 两服务 + loki-data 卷 |
+| `docker/grafana/provisioning/datasources/datasource.yml` | 加 Loki 数据源（`http://loki:3100`） |
+
+### 18.4 LogQL 常用查询（Grafana → Explore → Loki）
+
+```logql
+{service="order-service"}                          # 某服务全部日志
+{service="order-service"} |= "ERROR"               # 按关键字全文过滤
+{service=~"order-service|user-service", level="ERROR"}   # 多服务只看错误
+{service=~"gateway-service|order-service|user-service"} |= "6acdb2a1e9c86aba7f9caa7eeeddb811"   # 按 traceId 拉完整链路
+{service="order-service"} |~ `\[order-service\]`   # 正则用反引号包裹（双引号里 \[ 是非法转义）
+```
+
+> 注意：`query_range` 默认只查最近 1 小时，GUI 里记得选时间范围；API 需显式传 `start` 参数。
+
+### 18.5 实测验证与踩坑
+
+**验证结果**（2026-10-13）：登录 `/api/login` 拿 token → 调 `/api/orders/fail` → Loki 中按 traceId `6acdb2a1e9c86aba…` 一次查出该请求的 WARN + ERROR 日志对，traceId 与 Zipkin 中完全一致——metrics + tracing + logging 三支柱闭环。新增内存仅 loki 193MiB + promtail 50MiB，符合 5GB WSL2 预算。
+
+| 坑 | 现象 | 解法 |
+|----|------|------|
+| Promtail 首次补传积压日志被限速 | `429 Ingestion rate limit exceeded (limit: 4194304 bytes/sec)`——JMeter 压测攒了几十万行历史日志，默认 4MB/s 顶不住 | `limits_config` 调大 `ingestion_rate_mb: 16` + `ingestion_burst_size_mb: 32` |
+| LogQL 正则转义 | `\[` 在双引号查询串里报 `invalid char escape` | 正则整体用**反引号**包裹：`` |~ `\[order-service\]` `` |
+| 堆栈续行没有 traceId | `at xxx.run(...)` 每行是独立日志条目，traceId 只在首行 | 查 traceId 前先按 `\|= " ERROR "` 定位首行 |
+| Spring Boot 3 的 traceId 格式变了 | 不是 Sleuth 的 `[app,traceId,spanId]`，而是 **`[traceId-spanId]` 独立中括号段**（破折号连接） | 查询/正则按新格式写，别再按逗号格式匹配 |
+| 网关不逐条记请求日志 | 按 traceId 只能查到 order/user 的业务日志 | 正常现象；网关只在鉴权失败/降级时打日志 |
+
+### 18.6 关键设计决策（面试高频）
+
+- **traceId 绝不能做成标签**：每个请求一个唯一值 → 标签基数爆炸会撑爆 Loki 索引。正确做法是留在日志正文里，查询时 `|= "traceId"` 全文过滤——这正是"Loki 只索引标签"设计哲学的体现。
+- **Spring Boot 3 + Micrometer Tracing 默认把 traceId/spanId 写进日志**（MDC），所以应用侧零配置就能按 traceId 串联日志。
+- **Promtail 挂 Docker socket 采集，应用完全无感知**——对比 ELK 路线里应用要加 logback encoder 依赖改配置，这是云原生采集的主流姿势。
+
+## 十九、RocketMQ 三大特性实战：顺序消息 / 延迟消息 / 消息积压
+
+第十章覆盖了普通消息与事务消息，本章补齐剩余三大特性。先给一个总纲——**三大特性各自落在链路的不同位置**，学习时别混为一谈：
+
+| 特性 | 落在哪一端 | 一句话原理 |
+|---|---|---|
+| 延迟消息 | **生产端**一次性 API | 发送时指定 delayLevel，Broker 内部延迟队列到点改写回真实 queue |
+| 顺序消息 | **双端契约**（缺一不可） | 生产端 hashKey 路由进同一 queue + 消费端 ORDERLY 队列锁 |
+| 消息积压 | **消费端产能** + 运维监控 | 消费上限 = 消费线程数 ÷ 单条耗时；洪峰 > 上限 ⇒ Diff Total 增长 |
+
+三个特性各配一个可重复执行的验证脚本（`scripts/` 下）：`double-order.ps1`、`cas-race-test.ps1`、`msg-backlog.ps1`。
+
+### 19.1 顺序消息：订单状态流转
+
+**场景**：订单状态机 创建→已支付→打包中→已发货→配送中→已签收，同一订单必须严格按序消费；不同订单之间无序即可。
+
+**双端各做一半**（`OrderStatusDemoController` 生产 / `OrderStatusConsumer` 消费，Topic `order-status-topic`）：
+
+```
+生产端：syncSendOrderly("order-status-topic:STATUS_CHANGE", msg, hashKey = String.valueOf(orderId))
+        └─ MessageQueueSelector：queue = queues[hash(orderId) % queues.size()]
+           同一 orderId 永远落在同一 queue（queue 内天然 FIFO）
+
+消费端：consumeMode = ConsumeMode.ORDERLY
+        └─ 消费端对每个 MessageQueue 加锁，同一 queue 同一时刻只有一个线程消费
+           按 queue 内顺序逐条取出
+```
+
+生产端保证"同一订单的消息进同一队列"，消费端保证"队列内串行消费"——**两端配合才有序**：只做生产端分区、消费端仍 CONCURRENTLY，同一 queue 内多线程拉取照样乱序；只做消费端加锁、生产端乱路由，消息根本不在一个 queue 里。
+
+**验证**（`double-order.ps1`）：301/302 两订单并发发送，各 6 条状态消息。实测 14 条日志：同一 orderId 的 step 严格 1→6 递增，两订单之间交错——**分区有序、全局无序**，正是顺序消息的语义。
+
+**顺序消费的核心代价——失败处理**：
+
+| | 并发消费 CONCURRENTLY（积分消费者） | 顺序消费 ORDERLY（状态消费者） |
+|---|---|---|
+| 失败后 | 进重试队列稍后重投，**不影响**其它消息 | 当前 queue 挂起（SUSPEND_CURRENT_QUEUE_A_MOMENT），原地反复重试，**后续消息全部排队等待** |
+| 吞吐 | 高 | 受最慢消息拖累 |
+| 适用 | 通知类、可乱序 | 状态机、账户流水等必须保序 |
+
+模拟观察：`/orders/status-demo?orderId=301&failStep=3`——step 3 首次抛异常挂起 queue，重试放行后 4~6 才被消费，日志时间差一目了然。
+
+### 19.2 延迟消息：订单超时自动取消
+
+**场景**：下单后 10s 未支付自动取消（学习环境 level 3；生产用 level 14 = 10 分钟）。
+
+**发送**挂在 Seata 下单链路的 afterCommit 里（与积分消息同点，回滚必不发）：
+
+```java
+// OrderService —— 事务提交后发延迟消息（delayLevel=3 → 10s 后投递）
+rocketMQTemplate.syncSend("order-delay-topic:ORDER_DELAY_CHECK",
+        MessageBuilder.withPayload(msg).build(), 3000, 3);
+```
+
+生产端是一次性 API：发完即走，**定时全由 Broker 完成**（消息先进内部 SCHEDULE_TOPIC_XXXX，到点改写回真实 queue，消费者才可见）。
+
+**消费**（`OrderDelayConsumer`）收到后用 **CAS 条件更新**取消：
+
+```sql
+UPDATE t_order SET status = 2 WHERE id = ? AND status = 0
+```
+
+- 影响 1 行 → 10s 内未支付，成功取消
+- 影响 0 行 → 已支付 / 已取消 / 订单不存在（事务回滚），跳过；重复投递天然幂等
+
+**为什么必须 CAS（本章最值钱的一课）**：`先 SELECT 判断再 UPDATE` 是两步写法，用户可能恰好在两步之间完成支付——无条件 UPDATE 会把已支付订单**覆盖成已取消**（丢失更新）。条件 UPDATE 把判断与写入合并成一条原子语句，与 payOrder 的 `WHERE status=0` 条件更新被 MySQL 行锁互斥，**两者必有一个赢家，绝无中间态**。
+
+**4.x 延迟级别是固定档位**（不可任意时长）：1=1s、2=5s、3=10s、4=30s、5=1m、6=2m … 14=10m；要任意时刻投递需 RocketMQ 5.x 的定时消息。
+
+**验证**（`cas-race-test.ps1 -Rounds 30`）：每轮下单后在同一时刻并发发起 pay 与 admin-cancel，实测 30 轮 0 个"支付成功却被取消"矛盾。
+
+### 19.3 消息积压：瞬时洪峰 vs 慢消费
+
+**制造积压**：`BacklogDemoController` 用 `sendOneWay`（不等 Broker ACK，生产端吞吐最高）把 3000 条消息一次性灌入 Broker（实测 11494 msg/s）；`BacklogConsumer` 每条 sleep 100ms（20 线程 → 上限约 200 msg/s）。
+
+**消费上限公式**：
+
+```
+单实例消费上限 ≈ consumeThreadNumber ÷ 单条耗时(秒) = 20 ÷ 0.1 = 200 msg/s
+```
+
+**观察**：`docker exec broker sh mqadmin consumerProgress -g order-backlog-consumer-group -n namesrv:9876`，盯 **Diff Total**（Broker 最大位点 − 消费位点 = 积压条数）冲高回落。
+
+**验证**（`msg-backlog.ps1`）：自动登录 → 灌入 → 采样 Diff 峰值 → 等归零 → 断言 4 项：
+
+| 指标 | 实测（默认 3000 条 / 100ms） |
+|---|---|
+| 生产速率（sendOneWay 洪峰） | 11494 msg/s |
+| 消费上限（1 实例 × 20 线程 ÷ 0.1s） | ~200 msg/s |
+| Diff Total 峰值 | 2960 ≈ 灌入量，洪峰几乎全部转为积压 |
+| 追平耗时 / 实均速率 | 21.1s / ~140 msg/s |
+
+**三种追平手段实测**（`-Count 6000`）：
+
+| 方案 | 追平耗时 | 与公式对照 |
+|---|---|---|
+| 20 线程（基准） | 29.8s | 6000 ÷ 200 ≈ 30s ✓ |
+| 128 线程（单实例拉满） | 4.3s | 6000 ÷ 1280 ≈ 4.7s ✓ |
+| 双实例 `--scale order-service=2` | 14.9s | 每实例独立线程池，产能线性叠加：6000 ÷ 400 ≈ 15s ✓ |
+
+**关键坑（实测踩到）**：真正生效的并发参数是 `consumeThreadNumber`（starter 2.3.0 映射为 `consumer.setConsumeThreadMin`）；`consumeThreadMax` 是**摆设**——RocketMQ 消费线程池是 ThreadPoolExecutor + **无界 LinkedBlockingQueue**，队列永远填不满 ⇒ maxPoolSize 永不扩容，实际并发恒等于 corePoolSize，只调 max 没有任何效果。
+
+**运维视角**：
+- 积压不是 bug，是**容量问题**——大促/重试风暴时生产速率 > 消费上限是常态，要的是"可观测 + 可扩容"，而不是消灭它
+- 单条耗时是产能天花板：sleep 100ms 时线程拉到 128 也只有 1280 msg/s；**扩实例是线性方案，优化单条耗时才是根治**
+- 监控盯 Diff Total（生产做法：Prometheus exporter + Grafana 面板告警，思路见十五章）
+
+> 局限说明：`mqadmin` 每次执行要起一个 JVM（~3.5s），脚本采样间隔约 4s，"追平耗时"是 4s 粒度的估算值；不影响峰值抓取——生产瞬时、消费慢，Diff 峰值总能被采样到。
+
+## 二十、RocketMQ 死信队列：可见 / 可补偿 / 不丢业务
+
+消费失败本是常态，但"怎么处置失败消息"决定了一套 MQ 是否可用于生产。RocketMQ 给出的答案是**死信队列（DLQ）**——重试也救不回来的消息不该无限重试拖垮整个消费组，而要**隔离**出来交给人工。本章把它做成一个**可见、可补偿、不丢业务**的完整闭环。
+
+### 20.1 死信是怎么产生的
+
+```
+生产者 → Topic → 消费者处理失败（抛异常）
+        → Broker 按梯度延迟重投（10s → 30s → 1m → … → 2h，默认 16 次）
+        → 重试耗尽仍失败 → Broker 自动投递到死信 Topic：%DLQ%<consumerGroup>
+```
+
+四个必须记住的事实：
+
+| 事实 | 说明 |
+|---|---|---|
+| **Topic 名固定** | `%DLQ%<消费组名>`，由 Broker **自动创建**，无需人工 `updateTopic` |
+| **消息体不变** | 进死信的 body 与原消息完全一致（仍是同一份 JSON 报文），可直接反序列化 |
+| **不会自动重投** | 死信消息**永久停留**在死信 Topic，只能人工/程序补偿——这正是它的价值：不让毒消息无限循环 |
+| **顺序消费例外** | `ORDERLY` 消费失败会**无限挂起 queue**、原地反复重试，**永远进不了死信**；毒消息场景必须用 `CONCURRENTLY` |
+
+> 本演示复用 `BacklogConsumer`（`order-backlog-consumer-group`，CONCURRENTLY），因此死信 Topic 为 `%DLQ%order-backlog-consumer-group`。
+
+**加速演示**：默认 16 次梯度重试最长要 2h，学习环境把 `maxReconsumeTimes` 压到 **2**（`@RocketMQMessageListener(maxReconsumeTimes = 2)`），约 10s + 30s 退避后即进死信（实测 3 条毒消息 ~45s 全部入死信）。
+
+**毒消息制造**：`BacklogConsumer` 中 `sleepMs < 0` 即抛异常：
+
+```java
+if (sleepMs < 0) {
+    throw new RuntimeException("模拟消费失败（毒消息 sleepMs=" + sleepMs + "），重试耗尽后进入死信队列");
+}
+```
+
+```powershell
+# 灌入 3 条毒消息
+POST /api/orders/backlog-demo?count=3&sleepMs=-1
+```
+
+### 20.2 三件套实现
+
+**① 可见——死信落库**（`DlqConsumer`，新消费组 `order-dlq-consumer-group` 订阅该死信 Topic）：
+
+```java
+@RocketMQMessageListener(topic = "%DLQ%order-backlog-consumer-group",
+        selectorExpression = "*", consumerGroup = "order-dlq-consumer-group")
+public class DlqConsumer implements RocketMQListener<MessageExt> { ... }
+```
+
+- 泛型用 **`MessageExt`**（而非业务 DTO）：DLQ 监听要读 `msgId` / `topic` / 属性等元数据，此时 starter **不做反序列化、直接透传原始消息**；body 作为字符串原样入库
+- 落库表 `order_db.t_dead_letter`：`msg_id` / `topic` / `consumer_group` / `body`（原文）/ `reason` / `status` / `retry_count` / 时间戳
+
+**② 可补偿——重投接口**（`DlqController`）：
+
+```java
+// POST /api/orders/dlq/retry?limit=10&sleepMs=0
+读 t_dead_letter(status=0) → 反序列化 body → 修复（覆盖导致失败的 sleepMs）
+→ 打上补偿标记 dlqId → 重投原 Topic → 消费者成功 → 回写 status=1
+```
+
+**③ 不丢业务——闭环回写**：重投消息带 `dlqId`，`BacklogConsumer` 消费成功后回写死信状态，把"投递成功"升级为"**业务真的处理成功**"：
+
+```java
+if (message.getDlqId() != null) {
+    deadLetterMapper.updateById(new DeadLetter(){{ setId(message.getDlqId()); setStatus(1); }});
+}
+```
+
+**状态机**：`0 待补偿 → 1 补偿成功`（`2 补偿失败` 预留给人工介入场景）。
+
+### 20.3 完整闭环
+
+```
+毒消息(sleepMs=-1)
+  └─ 消费抛异常 ─→ Broker 梯度重试(2 次) ─→ 耗尽 → 自动投递 %DLQ%order-backlog-consumer-group
+        └─ DlqConsumer 落库 t_dead_letter(status=0, body 原样)      ← 可见 / 持久(不丢业务)
+              └─ POST /api/orders/dlq/retry 修复后重投              ← 可补偿
+                    └─ BacklogConsumer 消费成功 → 回写 status=1     ← 闭环
+```
+
+### 20.4 验证（`scripts/dlq-test.ps1`）
+
+```powershell
+.\scripts\dlq-test.ps1 -Count 3   # 退出码 = 失败断言数，全绿为 0
+```
+
+自动完成：登录 → 灌毒消息 → 轮询死信落库 → 查 Broker 侧死信 Topic → 调补偿重投 → 轮询回写 → **9 项断言**。实测结果：
+
+| 断言 | 实测 |
+|---|---|
+| 可见：毒消息全部落入死信并落库 | 新增 3/3 |
+| 可见：Broker 死信 Topic 同步增长 | MaxOffset 3 → 6 |
+| 可见：死信消费组已消费（Diff=0，全部落库） | Diff Total = 0 |
+| 不丢业务：原始报文完整保存 | body 含 `"sleepMs":-1` 3/3 |
+| 可见：来源 topic / 消费组记录正确 | 3/3 |
+| 补偿前：新增记录处于待补偿 | status=0 3/3 |
+| 可补偿：重投接口读库并成功重投 | resent 3/3，失败 0 |
+| 可补偿闭环：消费成功并回写 status=1 | 3/3（<0.1s） |
+| 可追溯：累计重投次数 | retryCount≥1 3/3 |
+
+**关键坑（实测）**：
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| ORDERLY 消费不进死信 | 顺序消费失败会无限挂起 queue | 毒消息必须用 CONCURRENTLY 消费者 |
+| `%DLQ%` 用别的组消费 | 需独立消费组订阅该死信 Topic | 本演示用 `order-dlq-consumer-group`，与业务组隔离 |
+| `reconsumeTimes` 进死信后归零 | DLQ 消息上的该字段已被 Broker 重置为 0 | 重试次数别指望从死信消息上读，按配置的 `maxReconsumeTimes` 说明即可 |
+| `%` 号主题名 | 命令行传参不要多加引号导致 sh 误解析 | `mqadmin topicStatus -t '%DLQ%<组名>' -n namesrv:9876` |
+
+**运维视角**：
+- 死信 = "**隔离**"而非"丢弃"：DLQ 数量应作为核心告警指标（Prometheus exporter + Grafana 盯死信增长速率）
+- 生产建议：死信消费组只做**落库/告警**，**不要自动无脑重投**（原消息大概率仍会失败，只会把死信搬回主流程）；重投应走人工确认或修数后触发
+- 本演示的 `sleepMs` 覆盖即"人工修数"的最小模拟：真实场景要修的是缺失字段、外部依赖返回值等
+
+---
+
+## 二十一、消息积压告警：Prometheus + Micrometer Gauge
+
+在第十五章 Prometheus 基础设施之上，给 RocketMQ 消费组加**积压告警**，实现"可见、可补偿、不丢业务"的延伸——不仅死信要告警，普通消息积压也要告警。
+
+### 21.1 核心指标
+
+| 指标 | 含义 | 数据源 |
+|------|------|--------|
+| `rocketmq_consumer_lag{consumer_group="<组名>"}` | 消费组积压条数（Diff Total = BrokerOffset − ConsumerOffset） | broker `mqadmin consumerProgress` |
+| `rocketmq_dead_letter_pending` | 死信待补偿条数（`t_dead_letter WHERE status=0`） | order-service `DeadLetterMapper` 查库 |
+
+两个指标都以 Micrometer Gauge 形式暴露在 `order-service/actuator/prometheus`，被 Prometheus 15s 抓取一次。
+
+### 21.2 架构与数据流
+
+```
+┌─────────────┐     docker exec      ┌─────────────────┐     POST /orders/internal/lag-report
+│  broker 容器 │  ←—— mqadmin ————→  │ lag-pusher.ps1   │  ─────────────────────────────→
+│  (mqadmin)   │   consumerProgress  │  (宿主机 15s 轮询) │                           │
+└─────────────┘                     └─────────────────┘                           ↓
+                                                                     ┌──────────────────────┐
+                                                                     │  order-service       │
+                                                                     │  ├─ MqLagMonitor     │
+                                                                     │  │   ├─ lagCache    │←── report() 更新
+                                                                     │  │   └─ Gauge 注册  │←── 启动时注册
+                                                                     │  └─ LagReportCtrl   │
+                                                                     └──────────┬───────────┘
+                                                                                │ scrape 15s
+                                                                                ↓
+                                                                     ┌──────────────────────┐
+                                                                     │   Prometheus         │
+                                                                     │   alerts.yml 规则评估 │
+                                                                     │   BacklogHigh firing  │
+                                                                     └──────────────────────┘
+```
+
+### 21.3 实现清单
+
+| 文件 | 作用 |
+|------|------|
+| `order-service/config/MqLagMonitor.java` | Gauge 注册中心：`lagCache` Map 存消费组 → Diff Total；`registerLagGauge()` 幂等注册；死信 gauge 闭包直接查 DB |
+| `order-service/controller/LagReportController.java` | `/orders/internal/lag-report` 接收宿主机推送；gateway 白名单放行 `/api/orders/internal/` |
+| `scripts/lag-pusher.ps1` | 宿主机脚本：每 15s `docker exec broker mqadmin consumerProgress -g <组>` 解析 `Diff Total:` 行，POST 到 lag-report |
+| `docker/prometheus/alerts.yml` | 告警规则：`BacklogHigh`（lag>1000 持续 1m → warning）、`DeadLetterPending`（≥5 → critical） |
+| `docker/prometheus/prometheus.yml` | 加 `rule_files: ["alerts.yml"]` |
+| `docker-compose.yml` | prometheus service 加 `./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro` |
+
+### 21.4 踩坑记录（比实现更值钱）
+
+| 坑 | 现象 | 解法 |
+|---|---|---|
+| **rocketmq-tools 5.1.x 协议不兼容 broker 4.9.7** | Java 侧 `DefaultMQAdminExtImpl` 发 request type 351（5.x 协议），broker 4.9.7 返回 `request type 351 not supported` | 放弃 Java 主动拉取，改宿主机脚本 exec broker 自带 mqadmin（版本天然匹配）+ 推送到 Java 侧 |
+| **内部接口被 Gateway JWT 拦截** | lag-pusher.ps1 POST 无 Bearer Token，Gateway 返回 401 | gateway `application.yml` 白名单加 `/api/orders/internal/` 前缀 |
+| **Gauge 重复注册** | Micrometer 不允许同名 Gauge 重复注册 | `registered` ConcurrentHashMap 幂等控制；启动时先注册已知消费组，动态发现时补注册 |
+| **lagCache 更新不及时** | Gauge 闭包读的是 lagCache 旧值 | lag-pusher.ps1 每 15s 推送，Prometheus 15s scrape，最大延迟 30s 内 |
+
+### 21.5 验证
+
+```powershell
+# 1. 启动 lag-pusher（宿主机后台）
+.\scripts\lag-pusher.ps1 -IntervalSec 15
+
+# 2. 触发积压
+.\scripts\msg-backlog.ps1 -Count 3000 -SleepMs 500
+
+# 3. 观察 Prometheus 指标（localhost:9090）
+rocketmq_consumer_lag{consumer_group="order-backlog-consumer-group"}  # 从 0 跳到 3000，随后回落
+
+# 4. 观察告警状态（localhost:9090/alerts）
+BacklogHigh  state=firing   # lag>1000 持续 1m 后触发
+
+# 5. 积压清完 → 告警自动恢复
+BacklogHigh  state=inactive # Diff Total 归零后约 1m 自动消失
+```
+
+实测：3000 条 × 500ms sleep 灌入后，lag 从 0 → 3000 → 逐步回落到 0；BacklogHigh 告警 firing → 积压清完 → 自动 resolved，全链路闭环。
+
+### 21.6 生产建议
+
+- **lag-pusher.ps1 启动方式**：学习环境用 `Start-Process pwsh -WindowStyle Hidden` 或 `Start-Job`；生产建议注册 Windows 任务计划程序（开机自启）或 docker compose 加 sidecar 容器（带宿主机 docker socket）
+- **Alertmanager**：当前只配了 Prometheus 内置告警 UI（`/alerts` 页面）；生产需加 Alertmanager 配 webhook/email/pagerduty 通知
+- **阈值调优**：`BacklogHigh` 的 `>1000` 是演示阈值；生产按业务量调整（大流量消费组可设 `>50000`，低流量 `>100`）
+- **死信告警联动**：`DeadLetterPending` 与 `BacklogHigh` 同时触发时，优先排查死信（死信消费组通常只做落库，不主动重投）
+
+## 二十二、CI/CD：GitHub Actions 构建 → 阿里云 ACR → 本机自动部署
+
+### 22.1 为什么需要 CI/CD
+
+前面二十一章下来，镜像的产出方式一直是**本机手工 `docker build`**，这留下三个真实痛点：
+
+| 痛点 | 具体表现 |
+| --- | --- |
+| 镜像没有版本化落点 | 镜像只躺在本机 Docker 里，换机器、清缓存、`docker image prune` 之后就没了；也没法回答"现在跑的镜像是哪次代码构建的" |
+| 没有质量闸门 | 改完代码直接 build 就上，过程中没有任何自动断言，第二十一章的 Gauge 逻辑回归了也只能靠肉眼发现 |
+| 部署全靠手敲 | `docker build` 三个服务 + `docker compose up -d` 全靠记忆，容易漏服务、记错参数 |
+
+本章要打通的最小闭环：
+
+```
+push 到 master
+   │
+   ▼
+① CI（GitHub 托管 runner, ubuntu-latest）
+   checkout → JDK17 + Maven 缓存 → mvn -B clean package（含单测）
+   → docker build × 3 → docker push × 3
+   │
+   ▼
+② 阿里云 ACR（镜像仓库，三个仓库各一个 1.0.0 tag）
+   │
+   ▼
+③ CD（本机 self-hosted runner，手动 Run workflow）
+   docker login → compose pull × 3 → compose up -d --force-recreate × 3
+   → 探针验证（网关 health + order-service 路由）
+   │
+   ▼
+④ 本机 Docker Desktop 上三个微服务容器换成新镜像（基础设施容器不动）
+```
+
+### 22.2 本章新增/改动的文件
+
+| 文件 | 作用 |
+| --- | --- |
+| [.github/workflows/ci.yml](.github/workflows/ci.yml) | CI：构建 + 单测 + 推镜像到 ACR |
+| [.github/workflows/deploy.yml](.github/workflows/deploy.yml) | CD：本机 runner 拉镜像 + 重建容器 + 探针验证 |
+| [docker-compose.deploy.yml](docker-compose.deploy.yml) | 部署覆盖文件：只把三个微服务的 `image` 指向 ACR |
+| [order-service/pom.xml](order-service/pom.xml) | 加 `spring-boot-starter-test`（test 作用域） |
+| [MqLagMonitorTest.java](order-service/src/test/java/com/study/cloud/order/config/MqLagMonitorTest.java) | 项目第一个单元测试 |
+
+### 22.3 CI：构建 + 单测 + 推镜像
+
+触发时机：`push` 到 master / `pull_request` / 手动 `workflow_dispatch`。PR 事件只跑构建和单测，**不推镜像**（来自 fork 的 PR 拿不到 Secrets，硬推会报认证失败）。
+
+```yaml
+      - name: 构建 + 单元测试
+        run: mvn -B clean package          # 不写 -DskipTests，测试失败即构建失败
+```
+
+三个刻意的设计取舍：
+
+1. **`mvn -B clean package` 不跳过测试**——这就是质量闸门。`spring-boot-starter-parent` 已托管 surefire，默认扫 `*Test.java`，`package` 阶段自动跑，失败直接让 CI 变红，不需要任何额外插件配置。
+2. **单 job 顺序执行，不用 matrix + artifact 传递**：order-service / user-service 都依赖 common，`mvn` 必须整仓一次 reactor 构建，拆 matrix 会把整仓构建重复 3 次；三个 jar 合计约 360MB，artifact 上传再下载比直接复用磁盘产物更慢。同 job 内 mvn 产出的 jar 就落在各服务 `target/` 下，`docker build` 直接吃。
+3. **构建上下文必须是服务自己目录**：Dockerfile 写的是 `COPY target/<artifactId>-1.0.0.jar app.jar`，所以 `docker build -t <镜像> ./user-service`，不能拿仓库根当上下文。
+
+镜像坐标用带默认值的 env，**只配 2 个 Secret 也能先跑起来**：
+
+```yaml
+env:
+  ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
+  ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'spring-cloud-study' }}
+```
+
+### 22.4 CD：本机 self-hosted runner 部署
+
+只支持**手动触发**（Actions 页面 → Run workflow）：学习期不自动部署，避免往 master 一 push 就把本机正在跑的一套容器全换掉。
+
+部署覆盖文件只写 image，其余键全部继承根 compose（多 `-f` 合并时后面的覆盖标量、未写的键一律沿用）：
+
+```yaml
+services:
+  user-service:
+    image: "${ACR_REGISTRY:?请先设置环境变量 ACR_REGISTRY}/${ACR_NAMESPACE:?...}/user-service:1.0.0"
+```
+
+**为什么不开一刀直接改根 `docker-compose.yml`**：根文件里的 `image: user-service:1.0.0` 是 12.2 节本机开发流程（`docker build` + `up`）依赖的，改成 ACR 地址会让本机开发也必须先 `docker login` 再 `pull`。覆盖文件把"本地开发"和"从仓库部署"两条路彻底分开。
+
+核心命令：
+
+```powershell
+# 只拉这三个（不带 --include-deps，不会去动 mysql/nacos 那堆基础设施镜像）
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull user-service order-service gateway-service
+
+# 重建（tag 是可变 tag，用 --force-recreate 兜底确保真换了镜像）
+docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --force-recreate user-service order-service gateway-service
+```
+
+探针验证为什么用内部接口而不是只查 health：
+
+```powershell
+# 该路径在网关白名单里（无需 JWT），body 传空对象 {} 会走早退分支、不改任何状态
+POST http://localhost:9000/api/orders/internal/lag-report   body: {}
+```
+
+一次请求同时证明三件事：**网关已起来 + Nacos 注册成功 + order-service 经网关路由通**。单查 `/actuator/health` 只能证明网关自身活着，下游没注册也照样 UP。脚本最多轮询 30 次 × 10s（服务重启后要等 Nacos 注册才通），失败时打印 `docker compose ps` 并 `throw`，让 job 明确变红。
+
+### 22.5 外部前置（只有本机能做）
+
+```powershell
+# ① GitHub 建仓后接上远端并推送（工作区已有未提交改动，先 commit）
+git remote add origin https://github.com/<账号>/<仓库名>.git
+git add .
+git commit -m "feat: 第22章 CI/CD（workflows + 部署覆盖文件 + MqLagMonitor 单测）"
+git push -u origin master
+```
+
+**workflow 文件必须在默认分支上，手动 Run workflow 才可用。**
+
+② **阿里云 ACR**：创建**个人版**实例 → 建命名空间（如 `spring-cloud-study`）→ 「访问凭证」里**设置固定密码**（个人版不支持临时 token）→ 复制控制台给出的登录命令。
+
+> 域名形态要注意：2024-09-09 之后新建的个人版实例是 `crpi-xxxx.cn-hangzhou.personal.cr.aliyuncs.com` 这种形态，老实例才是 `registry.cn-hangzhou.aliyuncs.com`。**一律以控制台复制的登录命令为准，不要照抄本文档。**
+
+③ **GitHub 仓库配置**（Settings → Secrets and variables → Actions）：
+
+| 类型 | 名称 | 说明 |
+| --- | --- | --- |
+| Secret | `ACR_USERNAME` | 镜像仓库登录名（阿里云账号全名，或去掉 `@xxx.onaliyun.com` 的部分） |
+| Secret | `ACR_PASSWORD` | 上面设置的**固定密码** |
+| Variable（可选） | `ACR_REGISTRY` | 不配则用 workflow 内置的 `registry.cn-hangzhou.aliyuncs.com` |
+| Variable（可选） | `ACR_NAMESPACE` | 不配则用 workflow 内置的 `spring-cloud-study` |
+
+④ **注册 self-hosted runner**（管理员权限 pwsh；token 在 仓库 Settings → Actions → Runners → New runner 生成，**1 小时有效**）：
+
+```powershell
+.\config.cmd --url https://github.com/<账号>/<仓库名> --token <token> --name pc-spring-cloud --labels spring-cloud
+.\run.cmd      # 前台运行
+```
+
+先用 `.\run.cmd` 前台跑：环境变量与 PATH 和你手工执行完全一致，排查最省事，也符合"不把脚本固化成常驻任务"的偏好。确认稳了再考虑 `.\svc.cmd install` 注册成开机自启的 Windows 服务（以 LocalSystem 身份跑，Docker Desktop 的 npipe 可达性需要实跑确认）。**Docker Desktop 必须处于运行状态**，否则部署 job 第一步 `docker version` 就会失败。
+
+### 22.6 验证
+
+```powershell
+# ① 本地单测（不需要任何外部依赖，纯内存 Gauge 断言）
+mvn -B -pl order-service -am test
+#   期望：Tests run: 1, Failures: 0, Errors: 0
+
+# ② 亲眼确认闸门有效：把断言里的 42 改成 43，再跑一次 → 本地变红
+#    CI 上同理变红。改回来即可。（这是本章最直观的收获）
+
+# ③ CI：push 后在 Actions 页面看到 job 绿，ACR 控制台三个仓库各出现 1.0.0
+
+# ④ CD：先确认 runner 在线（run.cmd 在跑）、Docker Desktop 已启动
+#    再在 Actions 页面手动 Run workflow → 日志里应出现容器 Recreated、探针通过
+
+# ⑤ 部署后回归
+docker compose ps                                  # 仍是 15 个容器 running
+#   且没有出现第二套重名容器（说明 COMPOSE_PROJECT_NAME 生效）
+POST http://localhost:9000/api/login               # {"username":"张三","password":"123456"}
+. .\scripts\verify-full-chain.ps1                  # 全链路（注意网关限流约 2 QPS，429 要退避重试）
+```
+
+### 22.7 踩坑记录
+
+- **`COMPOSE_PROJECT_NAME` 必须固定为 `spring-cloud-study`**（本章最坑的一个）。compose 的项目名默认取**当前目录名**，而 runner 的目录名 = GitHub 仓库名。名字对不上就会起出**第二套容器**，旧容器还占着 9000 端口，新网关直接起不来。本机 `docker compose ls` 实测现有项目名就是 `spring-cloud-study`，所以部署 job 里显式钉死它。
+- **`target/` 被 `.gitignore` 忽略**：CI checkout 后没有 jar，所以 `mvn package` 必须排在 `docker build` 前面，不能只 build 不编译。
+- **绝对不要加 `.dockerignore` 把 `target/` 排除掉**：Dockerfile 的 `COPY target/xxx.jar` 会直接构建失败。当前项目没有 `.dockerignore` 就是正确状态。
+- **固定 tag `1.0.0` 是可变的**：ACR 上同名 tag 会被覆盖，因此部署时必须 `--force-recreate`，且**不具备回滚能力**——想回滚只能把代码改回去再走一次 CI（这是本章确认过的取舍）。
+- **PR 事件不推镜像**：fork 的 PR 拿不到 Secrets，登录 ACR 必然失败，所以推流步骤加了 `if: github.event_name != 'pull_request'`。
+- **action 主版本号**：workflow 里用的是查证过的最新主版本（`checkout@v6` / `setup-java@v5` / `login-action@v4`）。如果首次运行报 "unable to resolve action"，把该 action 降一个大版本（v4/v3）即可，语法完全不变。
+- **GitHub 托管 runner 没有本地 Maven 镜像加速**：第一次构建约 3~6 分钟，靠 `cache: maven` 缓存 `~/.m2` 缓解。
+
+### 22.8 生产建议
+
+- **改成不可变 tag**：CI 同时打 `1.0.0` + `sha-<短哈希>`，部署时用 sha tag，`workflow_dispatch` 加一个 `image_tag` 输入，回滚就是填一个历史 tag 重跑 CD。
+- **把 E2E 验证纳入 CD**：本章刻意把 `scripts/verify-full-chain.ps1` 留在 CI 之外（CI 里没有 Nacos/MySQL/RocketMQ，跑不起来）；生产环境可以把 E2E 放到部署后的 CD 阶段，失败自动回滚。
+- **接 Alertmanager**：第二十一章遗留项，告警目前只在 Prometheus `/alerts` 页面可见，生产需要 webhook/邮件/电话通知。
+- **多环境**：用 GitHub Environments + 各自的 Secrets/Variables 区分 dev/staging/prod，部署 job 加 `environment:` 与人工审批。

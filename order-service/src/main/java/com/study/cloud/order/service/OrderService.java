@@ -1,5 +1,6 @@
 package com.study.cloud.order.service;
 
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.study.cloud.common.exception.BusinessException;
 import com.study.cloud.common.result.Result;
 import com.study.cloud.order.client.UserClient;
@@ -11,6 +12,7 @@ import io.seata.spring.annotation.GlobalTransactional;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.rocketmq.spring.core.RocketMQTemplate;
+import org.springframework.messaging.support.MessageBuilder;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -111,9 +113,81 @@ public class OrderService {
             public void afterCommit() {
                 rocketMQTemplate.syncSend("order-topic:ORDER_CREATED", msg);
                 log.info("【RocketMQ】事务提交后发送积分消息，orderId={}", order.getId());
+                // 延迟消息：delayLevel=3（10s 后投递），消费者收到后检查订单是否已支付
+                // 学习环境用 10s 方便观察；生产环境用 level=14（10分钟）做超时取消
+                rocketMQTemplate.syncSend("order-delay-topic:ORDER_DELAY_CHECK",
+                        MessageBuilder.withPayload(msg).build(), 3000, 3);
+                log.info("【RocketMQ】事务提交后发送延迟消息（10s 后检查支付状态），orderId={}", order.getId());
             }
         });
 
         return order.getId();
+    }
+
+    /**
+     * 查询订单（供 Controller 查状态用）。
+     */
+    public Order getOrderById(Long orderId) {
+        return orderMapper.selectById(orderId);
+    }
+
+    /**
+     * 模拟支付：把订单状态从 0（未支付）改为 1（已支付）。
+     * 在延迟消息到期前调用此方法，延迟消费者收到消息时看到 status=1 就不会取消。
+     */
+    /**
+     * 模拟支付：CAS 条件更新，仅当 status=0（未支付）时才改为 1（已支付）。
+     *
+     * 不能用"先 selectById 判断、再 updateById 无条件覆盖"的写法——
+     * 延迟消费者可能在两次 SQL 之间把订单取消，造成"支付成功却被取消"的丢失更新。
+     * 条件 UPDATE 把"判断+写入"合并成一条原子语句，由 MySQL 行锁保证与取消操作互斥：
+     *   UPDATE t_order SET status=1 WHERE id=? AND status=0
+     * 返回影响行数 0 = 订单已被取消/支付，本次支付失败。
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public boolean payOrder(Long orderId) {
+        int rows = orderMapper.update(null,
+                new LambdaUpdateWrapper<Order>()
+                        .eq(Order::getId, orderId)
+                        .eq(Order::getStatus, 0)
+                        .set(Order::getStatus, 1));
+        if (rows == 0) {
+            // 区分"不存在"和"状态不对"，给出准确的错误信息
+            Order order = orderMapper.selectById(orderId);
+            if (order == null) {
+                throw new BusinessException("订单不存在：" + orderId);
+            }
+            throw new BusinessException("订单已被取消或已支付，无法支付，status=" + order.getStatus());
+        }
+        log.info("【支付】订单已支付（CAS 命中 status=0），orderId={}", orderId);
+        return true;
+    }
+
+    /**
+     * 手动取消订单（测试用，延迟消费者也会自动调用类似逻辑）。
+     */
+    /**
+     * 取消订单：CAS 条件更新，仅当 status=0（未支付）时才改为 2（已取消）。
+     * 与 payOrder 互斥：两者的 UPDATE 都带 WHERE status=0，MySQL 行锁串行化，
+     * 只有一个能影响 1 行，另一个必然影响 0 行。
+     *
+     * @return true=本次调用成功取消；false=订单不存在或状态已变（无需取消）
+     */
+    @Transactional(rollbackFor = Exception.class)
+    public boolean cancelOrder(Long orderId) {
+        int rows = orderMapper.update(null,
+                new LambdaUpdateWrapper<Order>()
+                        .eq(Order::getId, orderId)
+                        .eq(Order::getStatus, 0)
+                        .set(Order::getStatus, 2));
+        if (rows == 0) {
+            Order order = orderMapper.selectById(orderId);
+            if (order == null) {
+                throw new BusinessException("订单不存在：" + orderId);
+            }
+            throw new BusinessException("订单已支付或已取消，无法取消，status=" + order.getStatus());
+        }
+        log.info("【取消】订单已取消（CAS 命中 status=0），orderId={}", orderId);
+        return true;
     }
 }

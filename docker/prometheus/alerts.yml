@@ -1,0 +1,39 @@
+# Prometheus 告警规则：RocketMQ 消费组积压 + 死信堆积
+# 由 Prometheus 每 15s 评估一次，告警状态在 /alerts 页面实时可见；
+# 本学习环境暂未配 Alertmanager（无 webhook/email），纯靠 Prometheus 内置告警 UI。
+#
+# 两个核心指标（由 order-service MqLagMonitor 埋 Micrometer gauge）：
+#   rocketmq_consumer_lag{consumer_group="<组名>"}  Diff Total = BrokerOffset − ConsumerOffset
+#   rocketmq_dead_letter_pending                    t_dead_letter WHERE status=0 计数
+#
+# 阈值说明：
+#   BacklogHigh:        lag >= 1000 且持续 >= 1m → 消费速率跟不上生产速率
+#   DeadLetterPending:  死信堆积 >= 5 → 有消息重试耗尽、需要人工介入
+#
+# 真实生产调整建议：
+#   - 阈值按业务量调（大流量消费组 lag>=50000 才告警）
+#   - 加 Alertmanager 配 webhook/email/pagerduty
+#   - Backlog 告警再加一条 "消费速率骤降"：rate(xxx_consumer_lag[5m]) > 0
+
+groups:
+  - name: rocketmq
+    rules:
+      - alert: BacklogHigh
+        expr: rocketmq_consumer_lag > 1000
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RocketMQ 消费组积压告警"
+          description: "消费组 {{ $labels.consumer_group }} 积压 {{ $value | printf \"%.0f\" }} 条，持续超过 1 分钟。可能原因：消费线程数不够、实例挂了、消费逻辑变慢。"
+          runbook: "docker exec broker sh mqadmin consumerProgress -g {{ $labels.consumer_group }} -n namesrv:9876"
+
+      - alert: DeadLetterPending
+        expr: rocketmq_dead_letter_pending >= 5
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "RocketMQ 死信堆积告警"
+          description: "t_dead_letter 待补偿 {{ $value | printf \"%.0f\" }} 条。查询：GET /api/orders/dlq/list?status=0"
+          runbook: "POST /api/orders/dlq/retry?limit=10&sleepMs=0（修复后重投，消费成功回写 status=1）"

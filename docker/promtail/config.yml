@@ -1,0 +1,36 @@
+# Promtail 采集配置：通过 Docker socket 自动发现容器，抓取全部 stdout/stderr 日志
+server:
+  http_listen_port: 9080
+
+positions:
+  filename: /tmp/positions.yaml    # 记录每个日志文件读到哪了，重启不重复采集
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:             # Docker 服务发现：新容器/新副本自动纳入采集
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # 容器名 → container 标签（去掉开头的 /）
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      # compose 服务名 → service 标签（查询主力：{service="order-service"}）
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'service'
+      # stdout/stderr → stream 标签
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+    pipeline_stages:
+      # JSON 格式日志（Spring Boot + LogstashEncoder）→ 直接提取 level 字段
+      # 非 JSON 日志（Nacos/MySQL 等）解析失败时 level 为空，不影响存储
+      - json:
+          expressions:
+            level: level
+      - labels:
+          level:
+      # 注意：traceId 【绝不能】做成标签！每请求一个值 → 高基数会撑爆 Loki 索引。
+      # traceId 留在日志正文里，查询时用 |= "abc123" 全文过滤即可（Loki 的强项）。

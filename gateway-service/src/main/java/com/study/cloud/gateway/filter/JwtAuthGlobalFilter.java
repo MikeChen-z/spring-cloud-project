@@ -12,6 +12,7 @@ import org.springframework.cloud.gateway.filter.GatewayFilterChain;
 import org.springframework.cloud.gateway.filter.GlobalFilter;
 import org.springframework.core.Ordered;
 import org.springframework.core.io.buffer.DataBuffer;
+import org.springframework.data.redis.core.ReactiveStringRedisTemplate;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
@@ -24,37 +25,38 @@ import reactor.core.publisher.Mono;
 import javax.crypto.SecretKey;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.util.List;
 
 /**
  * 全局 JWT 鉴权过滤器。
  *
- * 它是整条链路的"安检门"，对每个进入网关的请求执行：
- * 1. 白名单路径（如登录接口）直接放行
- * 2. 取 Authorization 头，要求 Bearer 前缀
- * 3. 用与 user-service 相同的密钥【真正验签 + 校验过期】（不是只看 token 存不存在）
- * 4. 验签通过：把用户 id/name 放入请求头透传给下游服务
- * 5. 任何一步失败：直接返回 401，请求不会到达下游
+ * 职责：白名单放行 → 取 token → 验签 → 黑名单检查 → 透传用户身份+角色。
  *
- * 安全性来自第 3 步的"验证"，而不是第 2 步的"携带"——伪造/过期的 token 过不了验签。
+ * 鉴权链路：
+ *   1. 白名单路径（登录、刷新接口）直接放行
+ *   2. 取 Authorization 头，要求 Bearer 前缀
+ *   3. 验签 + 过期校验
+ *   4. Redis 黑名单检查（登出后 token 主动失效）
+ *   5. 透传 X-User-Id / X-User-Name / X-User-Role 到下游服务
  */
 @Slf4j
 @Component
 public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {
 
-    /** Authorization 头的固定前缀，RFC 6750 规定的 Bearer 方案 */
     private static final String BEARER_PREFIX = "Bearer ";
 
     @Value("${jwt.secret}")
     private String secret;
 
-    /** 白名单路径：这些路径不需要 token（从 application.yml 读取） */
-    // @Value("${auth.white-list}")
-    // private List<String> whiteList;
-
     private final AuthProperties authProperties;
+    private final ReactiveStringRedisTemplate redisTemplate;
 
     private SecretKey key;
+
+    public JwtAuthGlobalFilter(AuthProperties authProperties,
+                               ReactiveStringRedisTemplate redisTemplate) {
+        this.authProperties = authProperties;
+        this.redisTemplate = redisTemplate;
+    }
 
     @PostConstruct
     public void init() {
@@ -66,7 +68,7 @@ public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {
         ServerHttpRequest request = exchange.getRequest();
         String path = request.getURI().getPath();
 
-        // 1. 白名单放行（登录、未来的注册接口等）
+        // 1. 白名单放行
         if (authProperties.getWhiteList().stream().anyMatch(path::startsWith)) {
             return chain.filter(exchange);
         }
@@ -78,7 +80,7 @@ public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {
         }
         String token = authHeader.substring(BEARER_PREFIX.length()).trim();
 
-        // 3. 验签 + 过期校验（签名错误、过期、被篡改都会抛异常）
+        // 3. 验签 + 过期校验
         Claims claims;
         try {
             claims = Jwts.parser()
@@ -91,17 +93,29 @@ public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {
             return reject(exchange, "令牌无效或已过期");
         }
 
-        // 4. 解析出用户身份，写入下游请求头（透传）
-        String userId = claims.getSubject();
-        String username = claims.get("name", String.class);
-        // HTTP 头不建议直接放中文，按 URL 编码后传递，下游解码
-        String encodedName = URLEncoder.encode(username, StandardCharsets.UTF_8);
+        // 4. Redis 黑名单检查（登出后 token 主动失效）
+        String blacklistKey = "blacklist:" + token;
+        return redisTemplate.hasKey(blacklistKey)
+                .defaultIfEmpty(false)
+                .flatMap(inBlacklist -> {
+                    if (Boolean.TRUE.equals(inBlacklist)) {
+                        log.warn("令牌在黑名单中 path={}", path);
+                        return reject(exchange, "令牌已失效，请重新登录");
+                    }
 
-        ServerHttpRequest mutated = request.mutate()
-                .header("X-User-Id", userId)
-                .header("X-User-Name", encodedName)
-                .build();
-        return chain.filter(exchange.mutate().request(mutated).build());
+                    // 5. 解析用户身份 + 角色，透传到下游
+                    String userId = claims.getSubject();
+                    String username = claims.get("name", String.class);
+                    String role = claims.get("role", String.class);
+                    String encodedName = URLEncoder.encode(username, StandardCharsets.UTF_8);
+
+                    ServerHttpRequest mutated = request.mutate()
+                            .header("X-User-Id", userId)
+                            .header("X-User-Name", encodedName)
+                            .header("X-User-Role", role != null ? role : "USER")
+                            .build();
+                    return chain.filter(exchange.mutate().request(mutated).build());
+                });
     }
 
     /** 返回 401 JSON 响应，中断请求 */
@@ -114,13 +128,6 @@ public class JwtAuthGlobalFilter implements GlobalFilter, Ordered {
         return response.writeWith(Mono.just(buffer));
     }
 
-    public JwtAuthGlobalFilter(AuthProperties authProperties) {
-        this.authProperties = authProperties;
-    }
-
-    /**
-     * 顺序值越小越先执行。-100 保证鉴权在路由转发和大多数内置过滤器之前完成。
-     */
     @Override
     public int getOrder() {
         return -100;

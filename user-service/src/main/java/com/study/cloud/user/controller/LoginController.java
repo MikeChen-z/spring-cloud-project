@@ -14,11 +14,16 @@ import org.springframework.web.bind.annotation.RestController;
 import java.util.Map;
 
 /**
- * 登录接口：校验账号密码，通过后签发 JWT。
+ * 登录接口：校验账号密码，通过后签发 JWT 双令牌。
  *
  * 调用方式（经过网关）：
  *   POST http://localhost:9000/api/login
  *   {"username":"张三","password":"123456"}
+ *
+ * 返回：
+ *   accessToken  - 短时效(30min)，用于业务接口鉴权
+ *   refreshToken - 长时效(7d)，用于刷新 access token
+ *   userId, username, role
  *
  * 该接口在网关白名单中，无需携带 token 即可访问。
  */
@@ -31,16 +36,18 @@ public class LoginController {
 
     @PostMapping("/login")
     public Result<Map<String, Object>> login(@Valid @RequestBody LoginRequest request) {
-        // 校验失败由全局异常处理器统一返回 401（用户不存在/密码错误）或 400（参数为空）
         User user = userService.login(request.username(), request.password());
 
-        // 校验通过：用用户 id 和用户名签发 token
-        String token = jwtUtil.generate(user.getId(), user.getName());
+        // 签发双令牌：access token 携带 role，refresh token 存 Redis
+        String accessToken = jwtUtil.generateAccessToken(user.getId(), user.getName(), user.getRole());
+        String refreshToken = jwtUtil.generateRefreshToken(user.getId(), user.getName());
 
         return Result.success(Map.of(
-                "token", token,
+                "accessToken", accessToken,
+                "refreshToken", refreshToken,
                 "userId", user.getId(),
-                "username", user.getName()
+                "username", user.getName(),
+                "role", user.getRole()
         ));
     }
 }

@@ -1,0 +1,41 @@
+# Loki 单节点配置（学习环境）
+# 与 Prometheus 对标的日志系统：只索引"标签"，日志正文压缩存块 → 内存/磁盘极省
+auth_enabled: false            # 学习环境关多租户，生产应开启
+
+server:
+  http_listen_port: 3100
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: /loki
+  replication_factor: 1        # 单节点副本 1
+  ring:
+    kvstore:
+      store: inmemory          # 单节点用内存 ring，无需 Consul/Etcd
+  storage:
+    filesystem:                # 块直接存本地卷（学习够用；生产换 S3/OSS）
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb              # Loki 3.x 推荐 TSDB 索引（替代旧 boltdb-shipper）
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h            # 索引按天滚动
+
+limits_config:
+  retention_period: 168h       # 日志保留 7 天，过期自动删（学习环境磁盘友好）
+  # 写入限速：默认 4MB/s 太小，Promtail 首次补传积压日志会被 429 拒绝
+  ingestion_rate_mb: 16        # 每租户持续写入 16MB/s
+  ingestion_burst_size_mb: 32  # 突发 32MB
+  per_stream_rate_limit: 8MB      # 单条流（单容器）限速
+  per_stream_rate_limit_burst: 16MB
+
+compactor:
+  working_directory: /loki/compactor
+  retention_enabled: true      # 上面 retention_period 生效的开关
+  delete_request_store: filesystem

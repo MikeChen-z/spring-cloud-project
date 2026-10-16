@@ -121,6 +121,20 @@ services:
     restart: unless-stopped
     mem_limit: 512m
 
+  sentinel-dashboard:
+    # Sentinel 控制台：可视化流控/熔断规则管理 + 实时监控（QPS、响应时间、熔断状态）
+    # 镜像 bladex/sentinel-dashboard:1.8.8 对应 Spring Cloud Alibaba 2023.0.1.0 的 Sentinel 1.8.8
+    image: bladex/sentinel-dashboard:1.8.8
+    container_name: sentinel-dashboard
+    environment:
+      JAVA_OPTS: "-Xms128m -Xmx256m"
+    ports:
+      - "8858:8858"
+    networks:
+      - study-net
+    restart: unless-stopped
+    mem_limit: 384m
+
   zipkin:
     image: openzipkin/zipkin:3
     container_name: zipkin
@@ -133,6 +147,75 @@ services:
       - study-net
     restart: unless-stopped
     mem_limit: 384m
+
+  # ========== 可观测性：Prometheus + Grafana ==========
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./docker/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.enable-lifecycle'
+    networks:
+      - study-net
+    restart: unless-stopped
+    mem_limit: 256m
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      # 初始管理员密码（学习环境固定，生产请改）
+      GF_SECURITY_ADMIN_PASSWORD: "admin123"
+      # 关闭匿名登录的告警横幅等，学习环境简洁优先
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      # 自动挂载 Prometheus 数据源，开箱即用
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - study-net
+    restart: unless-stopped
+    mem_limit: 256m
+
+  # ========== 可观测性：Loki 日志栈（配合 Prometheus + Grafana 补全三支柱） ==========
+  loki:
+    image: grafana/loki:3.2.1
+    container_name: loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./docker/loki/local-config.yaml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    networks:
+      - study-net
+    restart: unless-stopped
+    mem_limit: 256m
+
+  promtail:
+    image: grafana/promtail:3.2.1
+    container_name: promtail
+    command: -config.file=/etc/promtail/config.yml
+    volumes:
+      - ./docker/promtail/config.yml:/etc/promtail/config.yml:ro
+      # 挂 Docker socket：Promtail 通过 Docker API 发现容器、读 stdout 日志，应用零侵入
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      - loki
+    networks:
+      - study-net
+    restart: unless-stopped
+    mem_limit: 128m
 
   # ========== 微服务 ==========
 
@@ -149,12 +232,17 @@ services:
       REDIS_HOST: redis
       NAMESRV_ADDR: namesrv:9876
       ZIPKIN_HOST: zipkin
+      SENTINEL_DASHBOARD: sentinel-dashboard:8858
+      # Sentinel 客户端懒加载修复：默认 eager=false，传输层(command center/心跳)要等首个业务请求才初始化，
+      # 导致重启后 Dashboard 看不到规则、无监控。true = 启动时立即初始化。
+      SPRING_CLOUD_SENTINEL_EAGER: "true"
     depends_on:
       - nacos
       - mysql
       - redis
       - namesrv
       - seata
+      - sentinel-dashboard
     networks:
       - study-net
     restart: unless-stopped
@@ -168,12 +256,17 @@ services:
       REDIS_HOST: redis
       NAMESRV_ADDR: namesrv:9876
       ZIPKIN_HOST: zipkin
+      SENTINEL_DASHBOARD: sentinel-dashboard:8858
+      # Sentinel 客户端懒加载修复：默认 eager=false，传输层(command center/心跳)要等首个业务请求才初始化，
+      # 导致重启后 Dashboard 看不到规则、无监控。true = 启动时立即初始化。
+      SPRING_CLOUD_SENTINEL_EAGER: "true"
     depends_on:
       - nacos
       - mysql
       - redis
       - namesrv
       - seata
+      - sentinel-dashboard
     networks:
       - study-net
     restart: unless-stopped
@@ -190,9 +283,14 @@ services:
       NACOS_ADDR: nacos:8848
       REDIS_HOST: redis
       ZIPKIN_HOST: zipkin
+      SENTINEL_DASHBOARD: sentinel-dashboard:8858
+      # Sentinel 客户端懒加载修复：默认 eager=false，传输层(command center/心跳)要等首个业务请求才初始化，
+      # 导致重启后 Dashboard 看不到规则、无监控。true = 启动时立即初始化。
+      SPRING_CLOUD_SENTINEL_EAGER: "true"
     depends_on:
       - nacos
       - redis
+      - sentinel-dashboard
     networks:
       - study-net
     restart: unless-stopped
@@ -209,3 +307,5 @@ volumes:
   nacos-data:
   rocketmq-store:
   rocketmq-logs:
+  grafana-data:
+  loki-data:

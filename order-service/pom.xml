@@ -68,6 +68,12 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
+        <!-- Micrometer Prometheus 注册表：把指标以 Prometheus 文本格式暴露在 /actuator/prometheus -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
         <!-- Spring Cache 抽象 + Caffeine 本地缓存实现 -->
         <!-- 生产环境切 Redis：把下面 caffeine 换成 spring-boot-starter-data-redis，代码不用改 -->
         <dependency>
@@ -112,6 +118,14 @@
         <dependency>
             <groupId>io.zipkin.reporter2</groupId>
             <artifactId>zipkin-reporter-brave</artifactId>
+        </dependency>
+
+        <!-- 单元测试：JUnit 5 + AssertJ + Mockito（仅 test 作用域，不进最终 jar）
+             spring-boot-starter-parent 已托管 surefire，mvn package 会自动跑 *Test.java，失败即构建失败 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
         </dependency>
     </dependencies>
 

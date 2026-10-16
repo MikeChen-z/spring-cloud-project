@@ -14,6 +14,11 @@ spring:
       config:
         server-addr: ${NACOS_ADDR:127.0.0.1:8848}
         file-extension: yaml
+    # Sentinel 控制台地址：Dashboard 可可视化 user-service 的接口级实时监控，
+    # 动态下发流控/熔断规则（无需重启服务）
+    sentinel:
+      transport:
+        dashboard: ${SENTINEL_DASHBOARD:127.0.0.1:8858}
   # 数据源：把密码改成你本机 MySQL 的密码
   datasource:
     url: jdbc:mysql://${MYSQL_HOST:127.0.0.1}:3306/study_cloud?useSSL=false&serverTimezone=Asia/Shanghai&characterEncoding=utf8&allowPublicKeyRetrieval=true
@@ -41,7 +46,8 @@ rocketmq:
 jwt:
   secret: study-cloud-jwt-secret-key-2026-09-29-change-me-please-32bytes
   # token 有效期 1 小时（单位毫秒）
-  expiration: 3600000
+  access-expiration: 1800000   # Access Token 30 分钟
+  refresh-expiration: 604800000 # Refresh Token 7 天
 
 # MyBatis-Plus
 mybatis-plus:
@@ -72,6 +78,13 @@ seata:
 
 # 学习阶段暴露所有 actuator 端点（生产环境不要这么配）
 management:
+  # 给所有 Micrometer 指标统一打 application 标签，Grafana 可按服务筛选聚合
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
   endpoints:
     web:
       exposure:

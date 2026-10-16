@@ -65,6 +65,7 @@ CREATE TABLE `t_user` (
   `name` varchar(64) NOT NULL DEFAULT '' COMMENT '用户名',
   `email` varchar(128) NOT NULL DEFAULT '' COMMENT '邮箱',
   `password` varchar(128) NOT NULL DEFAULT '' COMMENT '密码（学习用明文）',
+  `role` varchar(20) NOT NULL DEFAULT 'USER' COMMENT '角色（ADMIN/USER）',
   `balance` decimal(10,2) NOT NULL DEFAULT '1000.00' COMMENT '账户余额',
   `points` int NOT NULL DEFAULT '0' COMMENT '用户积分',
   PRIMARY KEY (`id`),
@@ -78,7 +79,7 @@ CREATE TABLE `t_user` (
 
 LOCK TABLES `t_user` WRITE;
 /*!40000 ALTER TABLE `t_user` DISABLE KEYS */;
-INSERT INTO `t_user` VALUES (1,'张三','zhangsan@example.com','123456',724.00,42),(2,'李四','lisi@example.com','123456',1000.00,0),(3,'王五','wangwu@example.com','123456',1000.00,0);
+INSERT INTO `t_user` VALUES (1,'张三','zhangsan@example.com','123456','ADMIN',724.00,42),(2,'李四','lisi@example.com','123456','USER',1000.00,0),(3,'王五','wangwu@example.com','123456','USER',1000.00,0);
 /*!40000 ALTER TABLE `t_user` ENABLE KEYS */;
 UNLOCK TABLES;
 

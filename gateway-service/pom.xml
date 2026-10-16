@@ -42,6 +42,12 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
+        <!-- Micrometer Prometheus 注册表：把指标以 Prometheus 文本格式暴露在 /actuator/prometheus -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
+        </dependency>
+
         <!-- 网关限流：RequestRateLimiter 基于 Redis 令牌桶，必须用 Reactive 版 Redis 客户端 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -72,6 +78,30 @@
         <dependency>
             <groupId>io.zipkin.reporter2</groupId>
             <artifactId>zipkin-reporter-brave</artifactId>
+        </dependency>
+
+        <!-- Sentinel：Spring Cloud Alibaba Sentinel starter，自动检测 classpath 上的 Gateway，
+             配置 SentinelGatewayFilter 实现路由级流控。配合 Sentinel Dashboard 可视化管理规则。
+             与下面 Resilience4j CircuitBreaker 共存：Sentinel 负责 Dashboard 可视化 + 动态流控，
+             Resilience4j 负责网关路由级熔断（fallbackUri 降级）。 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
+        </dependency>
+
+        <!-- 网关熔断：Spring Cloud Gateway 的 CircuitBreaker filter 基于 Reactive Resilience4j。
+             当下游持续故障（失败率达阈值）时自动打开熔断器，直接 forward 到 fallbackUri 返回降级响应，
+             不再把请求打到已挂的后端——给下游喘息恢复时间，也避免网关线程被慢响应拖垮。
+             重试解决瞬时抖动，熔断解决持续故障，二者配合才完整。 -->
+        <dependency>
+            <groupId>org.springframework.cloud</groupId>
+            <artifactId>spring-cloud-starter-circuitbreaker-reactor-resilience4j</artifactId>
+        </dependency>
+
+        <!-- JSON 格式日志：与 user/order 一致，堆栈不被 Docker 切散 -->
+        <dependency>
+            <groupId>net.logstash.logback</groupId>
+            <artifactId>logstash-logback-encoder</artifactId>
         </dependency>
     </dependencies>
 

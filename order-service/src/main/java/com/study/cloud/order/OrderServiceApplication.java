@@ -6,6 +6,7 @@ import org.springframework.boot.autoconfigure.SpringBootApplication;
 import org.springframework.cache.annotation.EnableCaching;
 import org.springframework.cloud.client.discovery.EnableDiscoveryClient;
 import org.springframework.cloud.openfeign.EnableFeignClients;
+import org.springframework.scheduling.annotation.EnableScheduling;
 
 /**
  * 订单服务启动类（服务消费者）。
@@ -16,10 +17,12 @@ import org.springframework.cloud.openfeign.EnableFeignClients;
  * @MapperScan：扫描 MyBatis-Plus Mapper 接口（Seata 会自动代理其数据源）。
  * scanBasePackages：额外扫描 com.study.cloud.common，加载共享的全局异常处理器；
  *                   @EnableFeignClients / @MapperScan 各有独立扫描根，不受影响。
+ * @EnableScheduling：开启定时任务（MqLagMonitor 每 15s 拉取消费组积压埋 Prometheus gauge）。
  */
 @EnableFeignClients
 @EnableDiscoveryClient
 @EnableCaching
+@EnableScheduling
 @MapperScan("com.study.cloud.order.mapper")
 @SpringBootApplication(scanBasePackages = {"com.study.cloud.order", "com.study.cloud.common"})
 public class OrderServiceApplication {

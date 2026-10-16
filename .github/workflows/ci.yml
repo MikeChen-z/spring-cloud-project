@@ -1,0 +1,73 @@
+# CI：构建 + 单元测试 + 推镜像到阿里云 ACR
+#
+# 触发时机：
+#   push 到 master    → 完整跑（含推镜像）
+#   pull_request      → 只跑构建 + 单测，不推镜像（PR 来自 fork 时拿不到 Secrets）
+#   workflow_dispatch → 手动补跑
+#
+# 为什么是「单 job 顺序执行」而不是 matrix + artifact：
+#   1) order-service / user-service 都依赖 common，mvn 必须整仓一次 reactor 构建，
+#      拆成 matrix 会把整仓构建重复 3 次；
+#   2) 三个 jar 合计约 360MB，artifact 上传再下载比直接复用磁盘产物更慢。
+#   本 job 里 mvn 产出的 jar 就落在各服务 target/ 下，docker build 直接用。
+#
+# 为什么用 `mvn -B clean package` 而不是 -DskipTests：
+#   不带 -DskipTests，单测（order-service 的 MqLagMonitorTest）就在这一步跑，
+#   测试失败 → 构建失败 → 整个 CI 变红，这就是「质量闸门」。
+
+name: CI 构建与镜像推送
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+
+# ACR 仓库坐标：默认值可直接用；想改就配 Repository Variables
+#   Settings → Secrets and variables → Actions → Variables
+#   ACR_REGISTRY / ACR_NAMESPACE
+env:
+  ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
+  ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'spring-cloud-study' }}
+  IMAGE_TAG: '1.0.0'
+
+jobs:
+  build-test-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 拉取代码
+        uses: actions/checkout@v6
+
+      - name: 安装 JDK 17 并缓存 Maven 仓库
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: maven
+
+      - name: 构建 + 单元测试
+        run: mvn -B clean package
+
+      - name: 登录阿里云 ACR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: 构建并推送三个微服务镜像
+        if: github.event_name != 'pull_request'
+        run: |
+          set -e
+          for svc in user-service order-service gateway-service; do
+            image="$ACR_REGISTRY/$ACR_NAMESPACE/$svc:$IMAGE_TAG"
+            echo "========== 构建 $image =========="
+            # 构建上下文必须是服务自己目录：Dockerfile 里 COPY target/<artifactId>-1.0.0.jar
+            docker build -t "$image" "./$svc"
+            docker push "$image"
+          done
+
+      - name: 汇总
+        if: github.event_name != 'pull_request'
+        run: echo "已推送 $ACR_REGISTRY/$ACR_NAMESPACE/{user-service,order-service,gateway-service}:$IMAGE_TAG"

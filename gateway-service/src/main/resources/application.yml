@@ -12,9 +12,47 @@ spring:
   cloud:
     nacos:
       discovery:
-        server-addr: ${NACOS_ADDR:127.0.0.1:8848}
+        server-addr: ${NACOS_ADDR:127.0.0.1:8848}
+    # Sentinel 控制台：网关接入 Sentinel 后，Dashboard 可看到路由级实时监控
+    # （QPS、响应时间、被拒绝请求等），可动态下发流控规则（按 routeId 或 API 分组）
+    sentinel:
+      transport:
+        dashboard: ${SENTINEL_DASHBOARD:127.0.0.1:8858}
+        heartbeat-interval-ms: 10000
+      filter:
+        enabled: true
     gateway:
+      # ===== 全局超时（针对所有路由的兜底）=====
+      # connect-timeout：TCP 连接建立阶段超时（ms），下游端口不通会快速失败而非长时间挂起
+      # response-timeout：从请求发出到读完响应的整体超时（Duration 写法），覆盖大多数慢响应场景
+      httpclient:
+        connect-timeout: 2000
+        response-timeout: 5s
       routes:
+        # 管理员接口路由：RBAC 权限控制，仅 ADMIN 角色可访问
+        - id: admin-service
+          uri: lb://user-service
+          predicates:
+            - Path=/api/admin/**
+          filters:
+            - StripPrefix=1
+
+        # Token 刷新接口：白名单路径（access token 可能已过期）
+        - id: user-refresh
+          uri: lb://user-service
+          predicates:
+            - Path=/api/refresh
+          filters:
+            - StripPrefix=1
+
+        # 登出接口：需要有效 access token
+        - id: user-logout
+          uri: lb://user-service
+          predicates:
+            - Path=/api/logout
+          filters:
+            - StripPrefix=1
+
         # 登录接口：白名单路径，无需 token
         # 例：POST http://localhost:9000/api/login -> lb://user-service/login
         - id: user-login
@@ -23,6 +61,17 @@ spring:
             - Path=/api/login
           filters:
             - StripPrefix=1
+            # 登录接口限流：防暴力破解，比业务接口更严格。
+            # replenishRate=1 每秒只补 1 个令牌，burstCapacity=10 桶最多攒 10 个，
+            # 防暴力破解靠 replenishRate=1 限制持续速率，burstCapacity=10 允许短时突发。
+            # key-resolver 用 userKeyResolver：没 token 时按客户端 IP 限流，
+            # 防止攻击者用不同 token 绕过。
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userKeyResolver}"
+                redis-rate-limiter.replenishRate: 1
+                redis-rate-limiter.burstCapacity: 10
+                redis-rate-limiter.requestedTokens: 1
 
         # /api/users/** 转发到 user-service，并剥掉第一段 /api
         # 例：GET http://localhost:9000/api/users/1 -> lb://user-service/users/1
@@ -32,13 +81,13 @@ spring:
             - Path=/api/users/**
           filters:
             - StripPrefix=1
-            # 网关层限流：Redis 令牌桶。replenishRate=每秒补 2 个令牌，burstCapacity=桶最多攒 4 个
-            # 突发 8 个并发 → 前 4 个消耗桶内令牌放行，其余立刻 429（不等令牌）
+            # 网关层限流：Redis 令牌桶。replenishRate=每秒补 2 个令牌，burstCapacity=桶最多攒 20 个
+            # burstCapacity 设为 20 避免干扰熔断测试（slidingWindowSize=10）
             - name: RequestRateLimiter
               args:
                 key-resolver: "#{@userKeyResolver}"
                 redis-rate-limiter.replenishRate: 2
-                redis-rate-limiter.burstCapacity: 4
+                redis-rate-limiter.burstCapacity: 20
                 redis-rate-limiter.requestedTokens: 1
 
         # Nacos 配置动态刷新演示接口
@@ -58,18 +107,111 @@ spring:
             - Path=/api/orders/**
           filters:
             - StripPrefix=1
+            # 网关限流：Redis 令牌桶，保护 order-service 不被突发流量打垮。
+            # replenishRate=2 每秒补 2 个令牌，burstCapacity=20 桶最多攒 20 个。
+            # burstCapacity 设为 20 是为了不干扰熔断测试（slidingWindowSize=10 需 10 次请求）。
+            # 限流在熔断之前：先挡掉超额流量，再让合法流量经过熔断/重试链路。
+            - name: RequestRateLimiter
+              args:
+                key-resolver: "#{@userKeyResolver}"
+                redis-rate-limiter.replenishRate: 2
+                redis-rate-limiter.burstCapacity: 20
+                redis-rate-limiter.requestedTokens: 1
+            # 【已迁移到 Sentinel】网关层熔断原由 Resilience4j CircuitBreaker filter 负责，
+            # 现 Sentinel 接管：在 Dashboard 对 gateway-service 的路由资源配置 degrade 规则。
+            # 熔断打开时 Sentinel 返回 429（可自定义 blockResponse），不再 forward 到 /fallback/order。
+            # Feign 级 fallback → order-service 内 UserClientFallbackFactory（保持不变）
+            # 自动重试：下游瞬时故障（5xx / 连接失败）时由网关重发，调用方无感知。
+            # 安全边界（三条缺一不可）：
+            #   methods=GET   只重试幂等的 GET；POST 下单绝不能重试（会重复下单/与幂等令牌冲突）
+            #   series=5xx    下游没处理成功才重试；4xx 参数错误重试无意义
+            #   exceptions    只留 IOException（连接被拒，连接都没建立，重试安全）；
+            #                 刻意【不含 TimeoutException】——响应超时下游可能已在处理，
+            #                 且 /orders/timeout 的 2s 超时若重试会叠加成 6s
+            - name: Retry
+              args:
+                retries: 2                 # 最多重试 2 次（首次 + 2 = 共 3 次尝试）
+                series: SERVER_ERROR
+                methods: GET
+                exceptions:
+                  - java.io.IOException
+                backoff:
+                  first-backoff: 100ms    # 第一次重试前等 100ms
+                  max-backoff: 1s
+                  factor: 2               # 指数退避：100ms → 200ms，给下游恢复时间
+                  based-on-previous-value: false
+          # 单路由超时：覆盖全局 httpclient.response-timeout=5s，order 接口 2s 内必须返回。
+          # 演示 /orders/timeout（sleep 5s）将触发 504；而 /orders/slow（300ms）、/orders/{id} 等正常接口不受影响。
+          # 注意：metadata 走 RouteMetadata 解析路径，只认 Long 毫秒 或 ISO-8601(PT2S)，
+          #       "2s" 这种 Spring Duration 风格字符串【不被识别、静默忽略】，会回退到全局 5s。
+          metadata:
+            response-timeout: 2000   # 毫秒 Long
+            connect-timeout: 1000
 
 # 鉴权配置
 auth:
   # 白名单：以下路径前缀的请求不做 JWT 校验（登录接口本身不可能带 token）
   white-list:
     - /api/login
+    - /api/refresh
+    - /fallback
+    # 宿主机 lag-pusher.ps1 定期推送消费组积压数据到 order-service 内部接口
+    - /api/orders/internal/
+  # RBAC 权限规则：路径模式 -> 允许的角色列表
+  # 未匹配到规则的路径默认放行（已登录即可访问）
+  permission-rules:
+    - pattern: /api/admin/**
+      roles:
+        - ADMIN
 
 # JWT 验签密钥：必须与 user-service 的 jwt.secret 完全一致，否则所有合法 token 都会验签失败
 jwt:
   secret: study-cloud-jwt-secret-key-2026-09-29-change-me-please-32bytes
 
+# Resilience4j 熔断器参数（Spring Cloud CircuitBreaker reactive-resilience4j 自动读取）
+# 这些参数作用于所有未单独配置的熔断器（default 配置），包括 order-circuit-breaker。
+# 参数含义：
+#   slidingWindowSize=10         统计窗口 10 次调用
+#   minimumNumberOfCalls=10      至少 10 次调用才开始计算失败率
+#   failureRateThreshold=50      失败率 ≥ 50% 触发熔断（10 次中 5 次失败即触发）
+#   slowCallRateThreshold=80     慢调用比例 ≥ 80% 也触发熔断（即使没报错）
+#   slowCallDurationThreshold=2s 超过 2s 算慢调用
+#   waitDurationInOpenState=10s  熔断打开 10s 后自动转半开
+#   permittedNumberOfCallsInHalfOpenState=3  半开时放 3 次探测，全成功才转关闭
+#   automaticTransitionFromOpenToHalfOpenEnabled=true  到时间自动转半开（默认 false 需外部触发）
+resilience4j:
+  circuitbreaker:
+    configs:
+      default:
+        registerHealthIndicator: true
+        slidingWindowType: COUNT_BASED
+        slidingWindowSize: 10
+        minimumNumberOfCalls: 10
+        failureRateThreshold: 50
+        slowCallRateThreshold: 80
+        slowCallDurationThreshold: 2s
+        waitDurationInOpenState: 10s
+        permittedNumberOfCallsInHalfOpenState: 3
+        automaticTransitionFromOpenToHalfOpenEnabled: true
+
+  # TimeLimiter：Reactive Resilience4j 会给每个被熔断器保护的调用额外套一层超时。
+  # 默认 timeoutDuration=1s，会【抢在】网关自己的 response-timeout=2s 之前触发，
+  # 导致 /orders/timeout 返回 503(走 fallback) 而非 504，耗时也变成 ~1s。
+  # 放宽到 10s（> 网关 2s response-timeout），让网关路由超时先生效、返回 504。
+  timelimiter:
+    configs:
+      default:
+        timeout-duration: 10s
+        cancel-running-future: true
+
 management:
+  # 给所有 Micrometer 指标统一打 application 标签，Grafana 可按服务筛选聚合
+  metrics:
+    tags:
+      application: ${spring.application.name}
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
   endpoints:
     web:
       exposure:

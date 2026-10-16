@@ -12,12 +12,13 @@ CREATE TABLE t_user (
     name     VARCHAR(64)  NOT NULL DEFAULT ''     COMMENT '用户名（登录名）',
     email    VARCHAR(128) NOT NULL DEFAULT ''     COMMENT '邮箱',
     password VARCHAR(128) NOT NULL DEFAULT ''     COMMENT '密码（学习用明文；生产必须用 BCrypt 加盐哈希存储）',
+    role     VARCHAR(20)  NOT NULL DEFAULT 'USER'  COMMENT '角色（ADMIN管理员/USER普通用户）',
     PRIMARY KEY (id),
     UNIQUE KEY uk_name (name)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='用户表';
 
 -- 初始数据（密码统一为 123456，明文仅用于本地学习）
-INSERT INTO t_user (id, name, email, password) VALUES
-    (1, '张三', 'zhangsan@example.com', '123456'),
-    (2, '李四', 'lisi@example.com',     '123456'),
-    (3, '王五', 'wangwu@example.com',   '123456');
+INSERT INTO t_user (id, name, email, password, role) VALUES
+    (1, '张三', 'zhangsan@example.com', '123456', 'ADMIN'),
+    (2, '李四', 'lisi@example.com',     '123456', 'USER'),
+    (3, '王五', 'wangwu@example.com',   '123456', 'USER');

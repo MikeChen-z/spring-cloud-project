@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Logback JSON 输出配置：用 LogstashEncoder 把每条日志输出为单行 JSON。
+  好处：exception 堆栈被塞进 stack_trace 字段（JSON 字符串值，换行符保留在值内），
+        Docker json-file 驱动不会再按 \n 切散堆栈 → Loki 里一条日志包含完整堆栈。
+  三个服务（user/order/gateway）共用相同配置。
+-->
+<configuration>
+    <!-- 引入 Spring Boot 默认配置（日志级别从 application.yml 读取、默认级别等） -->
+    <include resource="org/springframework/boot/logging/logback/defaults.xml"/>
+
+    <!-- JSON 输出到 stdout（Docker 采集 stdout） -->
+    <appender name="CONSOLE" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+            <!-- MDC 中的 traceId/spanId 默认自动包含（Spring Boot 3 + Micrometer Tracing） -->
+        </encoder>
+    </appender>
+
+    <root level="INFO">
+        <appender-ref ref="CONSOLE"/>
+    </root>
+</configuration>

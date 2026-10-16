@@ -46,10 +46,23 @@
             <artifactId>spring-cloud-starter-alibaba-nacos-config</artifactId>
         </dependency>
 
+        <!-- Sentinel：流控/熔断降级。配合 Sentinel Dashboard 可视化管理规则，
+             对 user-service 接口做 QPS 限流、热点参数限流、熔断降级 -->
+        <dependency>
+            <groupId>com.alibaba.cloud</groupId>
+            <artifactId>spring-cloud-starter-alibaba-sentinel</artifactId>
+        </dependency>
+
         <!-- 健康检查/监控，Nacos 配置热更新也依赖 actuator 端点 -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-actuator</artifactId>
+        </dependency>
+
+        <!-- Micrometer Prometheus 注册表：把指标以 Prometheus 文本格式暴露在 /actuator/prometheus -->
+        <dependency>
+            <groupId>io.micrometer</groupId>
+            <artifactId>micrometer-registry-prometheus</artifactId>
         </dependency>
 
         <!-- MyBatis-Plus（Spring Boot 3 专用 starter）：ORM + 通用 CRUD -->
@@ -75,6 +88,12 @@
         <dependency>
             <groupId>org.apache.rocketmq</groupId>
             <artifactId>rocketmq-spring-boot-starter</artifactId>
+        </dependency>
+
+        <!-- Redis：Token 刷新存储 + 登出黑名单 -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-starter-data-redis</artifactId>
         </dependency>
 
         <!-- JWT：登录接口签发令牌（版本由父 POM 托管） -->

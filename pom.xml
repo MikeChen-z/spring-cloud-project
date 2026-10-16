@@ -29,6 +29,8 @@
         <jjwt.version>0.12.6</jjwt.version>
         <!-- RocketMQ Spring Boot Starter：与 RocketMQ 4.9.x 服务端兼容 -->
         <rocketmq.version>2.3.0</rocketmq.version>
+        <!-- Logstash Logback Encoder：把日志输出成 JSON，堆栈不被 Docker 按行切散 -->
+        <logstash-logback.version>7.4</logstash-logback.version>
     </properties>
 
     <modules>
@@ -87,6 +89,12 @@
                 <groupId>org.apache.rocketmq</groupId>
                 <artifactId>rocketmq-spring-boot-starter</artifactId>
                 <version>${rocketmq.version}</version>
+            </dependency>
+            <!-- Logstash Logback Encoder：JSON 格式日志输出 -->
+            <dependency>
+                <groupId>net.logstash.logback</groupId>
+                <artifactId>logstash-logback-encoder</artifactId>
+                <version>${logstash-logback.version}</version>
             </dependency>
         </dependencies>
     </dependencyManagement>

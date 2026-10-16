@@ -1,5 +1,6 @@
 package com.study.cloud.common.web;
 
+import com.alibaba.csp.sentinel.Tracer;
 import com.study.cloud.common.exception.BusinessException;
 import com.study.cloud.common.result.Result;
 import com.study.cloud.common.result.ResultCode;
@@ -128,6 +129,23 @@ public class GlobalExceptionHandler {
      */
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Result<Void>> handleOther(Exception ex) {
+        // Seata 等 AOP 拦截器会把目标方法抛出的异常重新包成
+        // RuntimeException("try to proceed invocation error", cause)，
+        // 导致 @ExceptionHandler(BusinessException.class) 按精确类型匹配不上。
+        // 沿 cause 链解包：只要根源是 BusinessException，就按业务异常返回 4xx 而非 500。
+        Throwable cause = ex;
+        while (cause != null) {
+            if (cause instanceof BusinessException business) {
+                log.warn("【业务异常(解包)】{}", business.getMessage());
+                return ResponseEntity.status(business.getCode())
+                        .body(Result.fail(business.getCode(), business.getMessage()));
+            }
+            cause = cause.getCause();
+        }
+        // Sentinel Web MVC 适配器只在异常"传播到 Filter"时才会计数，
+        // 而 @ExceptionHandler 会把异常就地吞掉，Sentinel 看不见 → "异常比例"熔断统计永远为 0。
+        // 官方推荐做法：在异常处理器里手动上报。当前无 Sentinel 上下文时为空操作，无副作用。
+        Tracer.trace(ex);
         log.error("【系统异常】未预期的错误", ex);
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(Result.fail(ResultCode.SYSTEM_ERROR));

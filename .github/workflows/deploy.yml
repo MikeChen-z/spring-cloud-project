@@ -1,0 +1,87 @@
+# CD：在本机 self-hosted runner 上拉新镜像并重建三个微服务容器
+#
+# 只支持手动触发（Actions 页面 → Run workflow）：
+#   学习期不自动部署，避免往 master 一 push 就把本机正在跑的容器全换掉。
+#
+# 前置条件（缺一不可）：
+#   1) 本机 runner 在线：在 runner 目录跑 .\run.cmd（前台），或在 GitHub 上看到 runner 是 Idle
+#   2) Docker Desktop 处于运行状态
+#   3) 仓库已配上 Secrets：ACR_USERNAME / ACR_PASSWORD
+#
+# 关键：COMPOSE_PROJECT_NAME 必须与「根 docker-compose.yml 所在目录名」推出来的项目名一致
+#   compose 的项目名默认取当前目录名，而 runner 的目录名 = GitHub 仓库名。
+#   如果和本机现有的 spring-cloud-study 项目名对不上，就会起出第二套容器，
+#   旧容器还占着 9000 端口 → 新网关直接起不来。
+#   本机 docker compose ls 实测现有项目名就是 spring-cloud-study。
+
+name: CD 部署到本机
+
+on:
+  workflow_dispatch:
+
+env:
+  COMPOSE_PROJECT_NAME: spring-cloud-study
+  ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
+  ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'spring-cloud-study' }}
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, windows, spring-cloud]
+    steps:
+      - name: 拉取代码（部署要用仓库里的两个 compose 文件）
+        uses: actions/checkout@v6
+
+      - name: 探测 runner 上的 Docker 是否可用
+        shell: pwsh
+        run: |
+          docker version
+          docker compose version
+
+      - name: 登录阿里云 ACR
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.ACR_REGISTRY }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: 拉取三个微服务的新镜像
+        shell: pwsh
+        # 显式列出服务名，只拉这三个；不加 --include-deps，不会去拉 mysql/nacos 那堆基础设施镜像
+        run: docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull user-service order-service gateway-service
+
+      - name: 重建三个微服务容器
+        shell: pwsh
+        # tag 是可变的（固定 1.0.0），用 --force-recreate 兜底确保真的换了镜像重建；
+        # 不带 --no-deps：如果基础设施没起，会顺带按 depends_on 起起来
+        run: docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --force-recreate user-service order-service gateway-service
+
+      - name: 探针验证（网关健康 + order-service 路由通）
+        shell: pwsh
+        run: |
+          # 探针用 POST /api/orders/internal/lag-report 且 body 传空对象 {}：
+          # 该路径在网关白名单里（无需 JWT），对空 map 会走早退分支、不改任何状态，
+          # 因此一次请求就同时证明：网关已起来 + Nacos 注册成功 + order-service 路由通。
+          $ok = $false
+          for ($i = 1; $i -le 30; $i++) {
+            try {
+              $health = Invoke-RestMethod -Uri 'http://localhost:9000/actuator/health' -TimeoutSec 5
+              $probe  = Invoke-RestMethod -Uri 'http://localhost:9000/api/orders/internal/lag-report' `
+                          -Method Post -ContentType 'application/json' -Body '{}' -TimeoutSec 5
+              if ($health.status -eq 'UP' -and $probe.code -eq 200) {
+                Write-Host "探测通过（第 $i 次尝试）：网关 health=UP，内部接口 code=200"
+                $ok = $true
+                break
+              }
+            } catch {
+              Write-Host "第 $i 次探测未通过：$($_.Exception.Message)"
+            }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) {
+            docker compose -f docker-compose.yml -f docker-compose.deploy.yml ps
+            throw '部署后探针验证失败：网关未 UP 或内部接口未返回 200（最多等待 5 分钟）'
+          }
+
+      - name: 输出容器状态
+        shell: pwsh
+        run: docker compose -f docker-compose.yml -f docker-compose.deploy.yml ps

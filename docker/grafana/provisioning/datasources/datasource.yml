@@ -1,0 +1,17 @@
+# Grafana 自动配置数据源，启动即可用，无需手动添加
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true
+
+  # Loki 日志数据源：Explore 里与 Prometheus 指标联动（metrics + logs 同屏排障）
+  - name: Loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true
