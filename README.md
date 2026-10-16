@@ -1799,6 +1799,19 @@ POST http://localhost:9000/api/orders/internal/lag-report   body: {}
 
 一次请求同时证明三件事：**网关已起来 + Nacos 注册成功 + order-service 经网关路由通**。单查 `/actuator/health` 只能证明网关自身活着，下游没注册也照样 UP。脚本最多轮询 30 次 × 10s（服务重启后要等 Nacos 注册才通），失败时打印 `docker compose ps` 并 `throw`，让 job 明确变红。
 
+**E2E 全链路验证与失败自动回滚**（探针之后的第二道闸门）：
+
+探针只证明"服务起来了"，不能证明"业务是对的"。CD 在探针通过后再跑 `.\scripts\verify-full-chain.ps1`（16 节真实断言：登录/鉴权/Seata/MQ/缓存/幂等/链路/限流/RBAC），脚本结尾 `exit $fail`，任一断言失败即非零退出 → step 变红。注意此时新版本已经在真实跑，E2E 会真实下单扣款（脚本开头自动把张三账户重置为 1000/1000，可重复执行）。
+
+自动回滚的锚点取自**部署前那一刻正在运行的旧版本**——拉新镜像之前先用 `docker ps` 读 user-service 容器的镜像 tag 写入 `$GITHUB_ENV`（`PREV_IMAGE_TAG`），后续 `recreate` / `probe` / `e2e` 三个带 `id` 的 step 任一 `outcome == 'failure'` 就触发回滚 step：把 `IMAGE_TAG` 换回旧 tag 重建容器，再做一轮轻量探针（网关 health UP 即过，旧版本是验证过的稳定版，不再跑全量 E2E）。
+
+两个设计取舍：
+
+- **拉镜像失败不触发回滚**：环境还没被碰过，旧容器仍在正常服务，回滚反而是多余重启。
+- **失败状态是粘性的**：回滚 step 执行成功也不会把 job 洗绿（前面失败的 step 已经红了），必须人工看过失败日志、决定下一步，这正是一次真实事故应有的处理方式。
+
+首次部署没有旧容器时锚点为空，回滚 step 会打印提示并跳过（此时只能人工排查）。E2E 自身耗时约 3~4 分钟（事务消息等 20s、熔断冷却 11s×2、令牌桶 10s×2），CD 总时长从 2~3 分钟升到 **6~8 分钟**。
+
 ### 22.5 外部前置（只有本机能做）
 
 ```powershell
@@ -1846,7 +1859,9 @@ mvn -B -pl order-service -am test
 # ③ CI：push 后在 Actions 页面看到 job 绿，ACR 控制台三个仓库各出现一个以 commit 哈希命名的 tag
 
 # ④ CD：先确认 runner 在线（run.cmd 在跑）、Docker Desktop 已启动
-#    再在 Actions 页面手动 Run workflow → 日志里应出现容器 Recreated、探针通过
+#    再在 Actions 页面手动 Run workflow → 日志里应依次出现：记录旧版本锚点 →
+#    拉镜像 → 容器 Recreated → 探针通过 → E2E 16 节全过，总时长约 6~8 分钟
+#    （可选演练：故意推一个坏版本，观察 recreate/probe/e2e 失败后自动回滚到旧 tag）
 
 # ⑤ 部署后回归
 docker compose ps                                  # 仍是 15 个容器 running
@@ -1863,11 +1878,13 @@ POST http://localhost:9000/api/login               # {"username":"张三","passw
 - **不可变 tag 取代固定 tag `1.0.0`**（本章后期升级）：早期 CI 固定推 `1.0.0`，ACR 上同名 tag 互相覆盖，无法回滚。现已改为 `IMAGE_TAG: ${{ github.sha }}`（ci.yml），每次 push 的镜像 tag = commit 完整哈希，永不覆盖、历史版本天然保留；CD 的 `image_tag` 输入同步改为**必填无默认值**，部署/回滚都是填一个 commit 哈希。
 - **PR 事件不推镜像**：fork 的 PR 拿不到 Secrets，登录 ACR 必然失败，所以推流步骤加了 `if: github.event_name != 'pull_request'`。
 - **`image_tag` 别填成 Digest**（实测踩过，CD run #2 失败）：ACR「镜像版本」页面有两列像哈希的东西——「镜像版本」列是 tag（40 位 commit 哈希，填这个），「Digest」列是镜像内容的 SHA-256（64 位，`image:tag` 语法不认，pull 报 `not found`）。
+- **自动回滚的锚点必须取自"部署前正在跑的容器"，而不是"上一次成功部署的 tag"**：后者要靠外部存储（文件/artifact）记账，多一层状态就多处错的可能；前者直接 `docker ps` 读 user-service 容器当前的镜像 tag 写入 `$GITHUB_ENV`，环境自己就是唯一事实源。代价是首次部署锚点为空，此时回滚 step 打印提示跳过、只能人工排查。
+- **回滚触发条件按 step `outcome` 而不是 `failure()`**：`recreate` / `probe` / `e2e` 各带 `id`，条件 `steps.<id>.outcome == 'failure'` 任一成立才回滚。刻意把"拉取镜像"排除在外——它失败时环境没被动过，回滚是多余重启。
+- **回滚成功 job 仍然是红的（失败粘性）**：GitHub Actions 里一个 step 失败，job 最终状态就是失败，后面的 step 全绿也洗不掉。这不是缺陷而是特性——自动回滚恢复的是服务，不是事故记录，必须人工看过日志才能消红。想精确区分"部署失败但已回滚"与"回滚也失败"，看回滚 step 的日志即可（后者会 `throw` 并打印"请立即人工介入"）。
 - **action 主版本号**：workflow 里用的是查证过的最新主版本（`checkout@v6` / `setup-java@v5` / `login-action@v4`）。如果首次运行报 "unable to resolve action"，把该 action 降一个大版本（v4/v3）即可，语法完全不变。
 - **GitHub 托管 runner 没有本地 Maven 镜像加速**：第一次构建约 3~6 分钟，靠 `cache: maven` 缓存 `~/.m2` 缓解。
 
 ### 22.8 生产建议
 
-- **把 E2E 验证纳入 CD**：本章刻意把 `scripts/verify-full-chain.ps1` 留在 CI 之外（CI 里没有 Nacos/MySQL/RocketMQ，跑不起来）；生产环境可以把 E2E 放到部署后的 CD 阶段，失败自动回滚。
 - **接 Alertmanager**：第二十一章遗留项，告警目前只在 Prometheus `/alerts` 页面可见，生产需要 webhook/邮件/电话通知。
 - **多环境**：用 GitHub Environments + 各自的 Secrets/Variables 区分 dev/staging/prod，部署 job 加 `environment:` 与人工审批。

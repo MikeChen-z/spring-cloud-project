@@ -3,6 +3,10 @@
 # 只支持手动触发（Actions 页面 → Run workflow）：
 #   学习期不自动部署，避免往 master 一 push 就把本机正在跑的容器全换掉。
 #
+# 部署后质量闸门：探针（服务起没起来）→ E2E 全链路（业务对不对）；
+#   重建/探针/E2E 任一失败 → 自动用「部署前记录的旧 tag」回滚。
+#   失败状态是粘性的：回滚成功也不会把 job 洗绿，必须人工看过才能消。
+#
 # 前置条件（缺一不可）：
 #   1) 本机 runner 在线：在 runner 目录跑 .\run.cmd（前台），或在 GitHub 上看到 runner 是 Idle
 #   2) Docker Desktop 处于运行状态
@@ -51,18 +55,33 @@ jobs:
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
+      - name: 记录当前运行版本（自动回滚的锚点）
+        shell: pwsh
+        run: |
+          # 三个微服务同 tag，取 user-service 容器的镜像即可；首次部署无旧容器则留空（回滚 step 会跳过）
+          $img = docker ps --filter "name=user-service" --format "{{.Image}}" | Select-Object -First 1
+          if ($img -and $img.Contains(':')) {
+            $prevTag = $img.Split(':')[-1]
+            Write-Host "当前运行版本 tag=$prevTag（若后续步骤失败将回滚到此版本）"
+            "PREV_IMAGE_TAG=$prevTag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          } else {
+            Write-Host "未检测到运行中的旧版本（首次部署？），后续失败将跳过自动回滚"
+          }
+
       - name: 拉取三个微服务的新镜像
         shell: pwsh
         # 显式列出服务名，只拉这三个；不加 --include-deps，不会去拉 mysql/nacos 那堆基础设施镜像
         run: docker compose -f docker-compose.yml -f docker-compose.deploy.yml pull user-service order-service gateway-service
 
       - name: 重建三个微服务容器
+        id: recreate
         shell: pwsh
-        # tag 是可变的（固定 1.0.0），用 --force-recreate 兜底确保真的换了镜像重建；
+        # --force-recreate 兜底：确保真按新拉的镜像重建容器，而不是复用旧容器；
         # 不带 --no-deps：如果基础设施没起，会顺带按 depends_on 起起来
         run: docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --force-recreate user-service order-service gateway-service
 
       - name: 探针验证（网关健康 + order-service 路由通）
+        id: probe
         shell: pwsh
         run: |
           # 探针用 POST /api/orders/internal/lag-report 且 body 传空对象 {}：
@@ -89,6 +108,39 @@ jobs:
             throw '部署后探针验证失败：网关未 UP 或内部接口未返回 200（最多等待 5 分钟）'
           }
 
+      - name: E2E 全链路验证（16 节真实断言：登录/鉴权/Seata/MQ/缓存/幂等/链路/限流/RBAC）
+        id: e2e
+        shell: pwsh
+        # 脚本结尾 exit $fail：任一断言失败即非零退出 → 本 step 变红 → 触发下方自动回滚。
+        # 注意此时新版本已在运行，E2E 会真实下单/扣款（脚本自己重置测试账户，可重复执行）。
+        # 耗时约 3~4 分钟（事务消息等 20s、熔断冷却 11s×2、令牌桶 10s×2），CD 总时长升到 6~8 分钟。
+        run: .\scripts\verify-full-chain.ps1
+
+      - name: 失败自动回滚到上一版本（重建/探针/E2E 任一失败触发）
+        # 拉取镜像失败不触发（环境没被动过，回滚是多余重启）；镜像拉取之后的任何失败都回滚
+        if: steps.recreate.outcome == 'failure' || steps.probe.outcome == 'failure' || steps.e2e.outcome == 'failure'
+        shell: pwsh
+        run: |
+          if (-not $env:PREV_IMAGE_TAG) {
+            Write-Host '未记录到旧版本 tag（首次部署？），无法回滚，请人工检查容器状态'
+            exit 0
+          }
+          Write-Host ">>>> 自动回滚：$env:IMAGE_TAG → $env:PREV_IMAGE_TAG <<<<"
+          $env:IMAGE_TAG = $env:PREV_IMAGE_TAG
+          docker compose -f docker-compose.yml -f docker-compose.deploy.yml up -d --force-recreate user-service order-service gateway-service
+          # 回滚后轻量探针：网关 health 恢复 UP 即视为回滚成功（旧版本是验证过的稳定版，不再跑全量 E2E）
+          $ok = $false
+          for ($i = 1; $i -le 12; $i++) {
+            try {
+              $health = Invoke-RestMethod -Uri 'http://localhost:9000/actuator/health' -TimeoutSec 5
+              if ($health.status -eq 'UP') { Write-Host "回滚探针通过（第 $i 次）：health=UP"; $ok = $true; break }
+            } catch { Write-Host "回滚探针第 $i 次未通过：$($_.Exception.Message)" }
+            Start-Sleep -Seconds 10
+          }
+          if (-not $ok) { throw '回滚后网关仍未 UP，请立即人工介入' }
+          Write-Host "已回滚到 $env:PREV_IMAGE_TAG。job 保持红色：新版本的失败记录不会被回滚洗掉"
+
       - name: 输出容器状态
+        if: always()   # 失败时也要看到现场（尤其是回滚后的状态）
         shell: pwsh
         run: docker compose -f docker-compose.yml -f docker-compose.deploy.yml ps
