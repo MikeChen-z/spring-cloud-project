@@ -18,11 +18,18 @@ name: CD 部署到本机
 
 on:
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: '镜像 tag（默认 1.0.0，回滚时填历史 tag）'
+        required: false
+        default: '1.0.0'
+        type: string
 
 env:
   COMPOSE_PROJECT_NAME: spring-cloud-study
   ACR_REGISTRY: ${{ vars.ACR_REGISTRY || 'registry.cn-hangzhou.aliyuncs.com' }}
   ACR_NAMESPACE: ${{ vars.ACR_NAMESPACE || 'spring-cloud-study' }}
+  IMAGE_TAG: ${{ inputs.image_tag || '1.0.0' }}
 
 jobs:
   deploy:
