@@ -1827,7 +1827,7 @@ git push -u origin master
 .\run.cmd      # 前台运行
 ```
 
-先用 `.\run.cmd` 前台跑：环境变量与 PATH 和你手工执行完全一致，排查最省事，也符合"不把脚本固化成常驻任务"的偏好。确认稳了再考虑 `.\svc.cmd install` 注册成开机自启的 Windows 服务（以 LocalSystem 身份跑，Docker Desktop 的 npipe 可达性需要实跑确认）。**Docker Desktop 必须处于运行状态**，否则部署 job 第一步 `docker version` 就会失败。
+先用 `.\run.cmd` 前台跑：环境变量与 PATH 和手动改执行完全一致，排查最省事，也符合"不把脚本固化成常驻任务"的偏好。确认稳了再考虑 `.\svc.cmd install` 注册成开机自启的 Windows 服务（以 LocalSystem 身份跑，Docker Desktop 的 npipe 可达性需要实跑确认）。**Docker Desktop 必须处于运行状态**，否则部署 job 第一步 `docker version` 就会失败。
 
 ### 22.6 验证
 

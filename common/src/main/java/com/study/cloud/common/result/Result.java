@@ -5,6 +5,7 @@ import lombok.NoArgsConstructor;
 
 /**
  * 统一返回体。所有 Controller（无论正常还是异常）最终都返回这个结构：
+ * 
  * <pre>
  * { "code": 200, "message": "成功", "data": { ... } }
  * </pre>
@@ -34,7 +35,7 @@ public class Result<T> {
         return new Result<>(ResultCode.SUCCESS.getCode(), ResultCode.SUCCESS.getMessage(), null);
     }
 
-    /** 成功并携带数据 */
+    /** 成功并携带数据返回 */
     public static <T> Result<T> success(T data) {
         return new Result<>(ResultCode.SUCCESS.getCode(), ResultCode.SUCCESS.getMessage(), data);
     }
