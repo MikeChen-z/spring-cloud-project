@@ -1766,7 +1766,9 @@ env:
 
 只支持**手动触发**（Actions 页面 → Run workflow）：学习期不自动部署，避免往 master 一 push 就把本机正在跑的一套容器全换掉。
 
-触发时**必填** `image_tag`（无默认值，防止"忘填就部署了旧版"）。tag = CI 构建时的 commit 完整哈希，三处任取：`git log -1 --format=%H`、GitHub 仓库 commit 列表、ACR 控制台镜像版本列表。**回滚 = 填历史 commit 哈希再跑一次 CD**。
+触发时**必填** `image_tag`（无默认值，防止"忘填就部署了旧版"）。tag = CI 构建时的 commit 完整哈希（**40 位**），三处任取：`git log -1 --format=%H`、GitHub 仓库 commit 列表、ACR 控制台镜像版本列表。**回滚 = 填历史 commit 哈希再跑一次 CD**。
+
+⚠️ 在 ACR 控制台复制时**分清两列**：「**镜像版本**」是 tag（40 位，填这个）；「**Digest / 摘要**」是镜像内容的 SHA-256（64 位，**不能**当 tag 用——`image:tag` 语法不认它，pull 会报 `not found`，本章实测踩过）。
 
 部署覆盖文件只写 image，其余键全部继承根 compose（多 `-f` 合并时后面的覆盖标量、未写的键一律沿用）：
 
@@ -1860,6 +1862,7 @@ POST http://localhost:9000/api/login               # {"username":"张三","passw
 - **绝对不要加 `.dockerignore` 把 `target/` 排除掉**：Dockerfile 的 `COPY target/xxx.jar` 会直接构建失败。当前项目没有 `.dockerignore` 就是正确状态。
 - **不可变 tag 取代固定 tag `1.0.0`**（本章后期升级）：早期 CI 固定推 `1.0.0`，ACR 上同名 tag 互相覆盖，无法回滚。现已改为 `IMAGE_TAG: ${{ github.sha }}`（ci.yml），每次 push 的镜像 tag = commit 完整哈希，永不覆盖、历史版本天然保留；CD 的 `image_tag` 输入同步改为**必填无默认值**，部署/回滚都是填一个 commit 哈希。
 - **PR 事件不推镜像**：fork 的 PR 拿不到 Secrets，登录 ACR 必然失败，所以推流步骤加了 `if: github.event_name != 'pull_request'`。
+- **`image_tag` 别填成 Digest**（实测踩过，CD run #2 失败）：ACR「镜像版本」页面有两列像哈希的东西——「镜像版本」列是 tag（40 位 commit 哈希，填这个），「Digest」列是镜像内容的 SHA-256（64 位，`image:tag` 语法不认，pull 报 `not found`）。
 - **action 主版本号**：workflow 里用的是查证过的最新主版本（`checkout@v6` / `setup-java@v5` / `login-action@v4`）。如果首次运行报 "unable to resolve action"，把该 action 降一个大版本（v4/v3）即可，语法完全不变。
 - **GitHub 托管 runner 没有本地 Maven 镜像加速**：第一次构建约 3~6 分钟，靠 `cache: maven` 缓存 `~/.m2` 缓解。
 
