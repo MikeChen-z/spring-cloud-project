@@ -16,7 +16,7 @@
 
 name: CD 部署到本机
 
-'on':
+on:
   workflow_dispatch:
     inputs:
       image_tag:
