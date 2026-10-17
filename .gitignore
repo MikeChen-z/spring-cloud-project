@@ -30,3 +30,6 @@ dump.rdb
 
 # ===== AI 辅助工具目录（Trae 生成的文档与 skill 配置，不入库） =====
 .trae/
+
+# ===== 钉钉机器人凭证（access_token + 加签密钥，用 dingtalk.yml.example 复制生成） =====
+docker/alertmanager/dingtalk.yml

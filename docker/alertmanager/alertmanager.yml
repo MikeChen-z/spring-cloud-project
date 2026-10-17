@@ -1,0 +1,29 @@
+# Alertmanager 主配置：告警分组 → 钉钉适配器 → 钉钉群机器人
+#
+# 数据流：Prometheus 评估 alerts.yml 产生 firing → POST 到本服务 :9093
+#         → 按 route 分组等待 → webhook POST 到 dingtalk-webhook:8060
+#         → 适配器把 Alertmanager payload 翻译成钉钉消息格式并加签 → 钉钉群
+#
+# 时间参数说明（学习环境刻意调短，让演练时告警快速到达）：
+#   group_wait:      同组第一条告警到达后等多久再发（攒一批合并发送）。生产常 30s~1m
+#   group_interval:  同组已有通知后，再有新告警加入时的最小发送间隔
+#   repeat_interval: 同一条告警持续 firing 时的重复提醒间隔。生产常 4h~1d
+#   resolve_timeout: 多久没收到更新就认为告警已恢复（Prometheus 自带 resolved 标记，此值兜底）
+
+global:
+  resolve_timeout: 1m
+
+route:
+  receiver: dingtalk
+  group_by: ['alertname', 'severity']
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 1h
+
+receivers:
+  - name: dingtalk
+    webhook_configs:
+      # study 是适配器 dingtalk.yml 里的 target 名，路径固定形态 /dingtalk/<profile>/send
+      - url: http://dingtalk-webhook:8060/dingtalk/study/send
+        # 恢复也发通知：故障注入演练的核心正反馈（firing → 修复 → resolved 全链路）
+        send_resolved: true

@@ -37,3 +37,40 @@ groups:
           summary: "RocketMQ 死信堆积告警"
           description: "t_dead_letter 待补偿 {{ $value | printf \"%.0f\" }} 条。查询：GET /api/orders/dlq/list?status=0"
           runbook: "POST /api/orders/dlq/retry?limit=10&sleepMs=0（修复后重投，消费成功回写 status=1）"
+  # ========== 实例级告警（第 23 章：配合 Alertmanager + 故障注入演练） ==========
+  # 两种"挂法"要用两种表达式，这是 dns_sd 与 static 两种服务发现的本质差异：
+  #   static 目标（gateway）：容器停止 → 目标还在但抓取被拒 → up == 0
+  #   dns_sd 目标（user/order，支持 --scale 多副本）：容器停止 → DNS A 记录消失
+  #     → target 整体缺席，up 指标压根不存在 → 必须用 absent()
+  # 多副本时单个副本故障不触发 absent（仍有存活 A 记录）——这是特性：高可用吸收故障。
+  - name: instance
+    rules:
+      - alert: InstanceDown
+        expr: up == 0
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "实例抓取失败：{{ $labels.job }}"
+          description: "Prometheus 已连续 30 秒无法抓取 {{ $labels.job }}（{{ $labels.instance }}）。可能原因：容器停止、应用卡死、端口不通。"
+          runbook: "docker compose ps 看状态；docker compose start <服务名> 恢复"
+
+      - alert: UserServiceDown
+        expr: absent(up{job="user-service"}) == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "user-service 全部副本消失"
+          description: "DNS 已无任何 user-service 的 A 记录（dns_sd 发现不到目标）。"
+          runbook: "docker compose ps user-service；docker compose up -d user-service"
+
+      - alert: OrderServiceDown
+        expr: absent(up{job="order-service"}) == 1
+        for: 30s
+        labels:
+          severity: critical
+        annotations:
+          summary: "order-service 全部副本消失"
+          description: "DNS 已无任何 order-service 的 A 记录（dns_sd 发现不到目标），下单/订单查询链路将失败。"
+          runbook: "docker compose ps order-service；docker compose up -d order-service"

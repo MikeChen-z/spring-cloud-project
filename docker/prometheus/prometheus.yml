@@ -11,6 +11,12 @@ global:
 rule_files:
   - "alerts.yml"
 
+# 告警发送：firing/resolved 事件推给 Alertmanager（:9093），由它分组后 webhook 到钉钉适配器
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
 scrape_configs:
   # Prometheus 自监控
   - job_name: prometheus

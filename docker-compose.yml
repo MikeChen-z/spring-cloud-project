@@ -166,6 +166,36 @@ services:
     restart: unless-stopped
     mem_limit: 256m
 
+  # ========== 告警通知：Alertmanager + 钉钉适配器（第 23 章） ==========
+  alertmanager:
+    image: prom/alertmanager:v0.28.1   # 不用 v0.34.x：加速器对新 tag 回源卡死（23.7 踩坑）
+    container_name: alertmanager
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./docker/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - study-net
+    restart: unless-stopped
+    mem_limit: 128m
+
+  # Alertmanager 不原生支持钉钉：适配器把 webhook payload 翻译成钉钉消息格式并加签
+  # profile 配置 dingtalk.yml 含机器人凭证、已 gitignore（用 dingtalk.yml.example 复制生成）
+  dingtalk-webhook:
+    image: timonwong/prometheus-webhook-dingtalk:v2.1.0
+    container_name: dingtalk-webhook
+    command:
+      - '--config.file=/etc/dingtalk/config.yml'
+    ports:
+      # 宿主机映射只为 curl 直测适配器；Alertmanager 走 study-net 内部访问即可
+      - "8060:8060"
+    volumes:
+      - ./docker/alertmanager/dingtalk.yml:/etc/dingtalk/config.yml:ro
+    networks:
+      - study-net
+    restart: unless-stopped
+    mem_limit: 64m
+
   grafana:
     image: grafana/grafana:11.2.0
     container_name: grafana

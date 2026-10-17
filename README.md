@@ -1691,7 +1691,7 @@ BacklogHigh  state=inactive # Diff Total 归零后约 1m 自动消失
 ### 21.6 生产建议
 
 - **lag-pusher.ps1 启动方式**：学习环境用 `Start-Process pwsh -WindowStyle Hidden` 或 `Start-Job`；生产建议注册 Windows 任务计划程序（开机自启）或 docker compose 加 sidecar 容器（带宿主机 docker socket）
-- **Alertmanager**：当前只配了 Prometheus 内置告警 UI（`/alerts` 页面）；生产需加 Alertmanager 配 webhook/email/pagerduty 通知
+- **Alertmanager**：~~当前只配了 Prometheus 内置告警 UI~~ → 第二十三章已落地：Alertmanager + 钉钉群机器人，firing/resolved 双通知，并配套故障注入演练脚本
 - **阈值调优**：`BacklogHigh` 的 `>1000` 是演示阈值；生产按业务量调整（大流量消费组可设 `>50000`，低流量 `>100`）
 - **死信告警联动**：`DeadLetterPending` 与 `BacklogHigh` 同时触发时，优先排查死信（死信消费组通常只做落库，不主动重投）
 
@@ -1886,5 +1886,100 @@ POST http://localhost:9000/api/login               # {"username":"张三","passw
 
 ### 22.8 生产建议
 
-- **接 Alertmanager**：第二十一章遗留项，告警目前只在 Prometheus `/alerts` 页面可见，生产需要 webhook/邮件/电话通知。
+- ~~**接 Alertmanager**~~：已落地，见第二十三章（Alertmanager + 钉钉机器人 + 故障注入演练）。
 - **多环境**：用 GitHub Environments + 各自的 Secrets/Variables 区分 dev/staging/prod，部署 job 加 `environment:` 与人工审批。
+
+## 二十三、Alertmanager 钉钉告警 + 故障注入演练
+
+第二十一章的告警只能在 Prometheus `/alerts` 页面"等人来看"，本章让它**主动找人**：firing 和 resolved 都推送到钉钉群。再用六个故障注入场景，实证前 22 章的容错机制（AT 回滚/自动重连/Nacos 摘除/告警闭环）不是纸上谈兵。
+
+### 23.1 为什么需要 Alertmanager
+
+Prometheus 的职责边界是**评估**：alerts.yml 算出 firing/resolved，展示在 `/alerts` 页面，仅此而已——它不发任何通知。Alertmanager 是独立的告警中枢：接收 Prometheus 的事件，做**分组**（同组告警合并成一条，防轰炸）、**去重**、**静默**、**路由**，再投递到通知通道。
+
+通道选型：钉钉群机器人。Alertmanager 原生支持 email/webhook/企业微信等，但**不原生支持钉钉**（钉钉要自己的消息 JSON 格式 + 加签），社区标准解法是适配器 `prometheus-webhook-dingtalk`：Alertmanager 用通用 webhook 发给它，它翻译成钉钉格式并做 HmacSHA256 加签后调机器人接口。
+
+### 23.2 架构与数据流
+
+```
+微服务 /actuator/prometheus ──scrape 15s──> Prometheus ──firing/resolved──> Alertmanager(:9093)
+                                                │ alerts.yml 评估               │ 分组 group_wait 10s
+                                                ↓                              │ webhook POST
+                                           /alerts 页面                         ↓
+                                                                  dingtalk-webhook(:8060 适配器)
+                                                                       │ 翻译格式 + 加签
+                                                                       ↓
+                                                              钉钉群机器人 → 手机通知
+```
+
+### 23.3 配置清单
+
+| 文件 | 作用 |
+|------|------|
+| `docker/alertmanager/alertmanager.yml` | 路由+分组参数+receiver；`send_resolved: true`（恢复也通知，演练的核心正反馈） |
+| `docker/alertmanager/dingtalk.yml.example` | 适配器 profile 模板（profile 名 `study` 对应 webhook 路径 `/dingtalk/study/send`） |
+| `docker/alertmanager/dingtalk.yml` | 真实凭证（access_token+加签密钥），**已 gitignore** |
+| `docker/prometheus/prometheus.yml` | 新增 `alerting.alertmanagers` 指向 `alertmanager:9093` |
+| `docker/prometheus/alerts.yml` | 新增 instance 组：InstanceDown / UserServiceDown / OrderServiceDown |
+| `docker-compose.yml` | 新增 alertmanager、dingtalk-webhook 两个服务（共约 80MB） |
+| `scripts/fault-drill.ps1` | 六场景故障注入演练脚本 |
+
+时间参数（学习刻意调短，演练时告警快速到达）：`group_wait: 10s`、`group_interval: 1m`、`repeat_interval: 1h`。生产参考值见 23.8。
+
+### 23.4 外部前置：钉钉群机器人（只有你能做，约 5 分钟）
+
+1. 钉钉 App 建群 → 群设置 → 机器人 → 添加「自定义」机器人
+2. 安全设置勾选**加签**，复制 webhook 地址（内含 access_token）和 SEC 开头的密钥
+3. 生成凭证文件并填入：
+
+```powershell
+Copy-Item docker/alertmanager/dingtalk.yml.example docker/alertmanager/dingtalk.yml
+# 编辑 dingtalk.yml，替换 url 的 access_token 和 secret
+```
+
+### 23.5 实例级告警：`up == 0` 与 `absent()` 的分工
+
+两种服务发现对应两种"挂法"，写错表达式告警永远不响：
+
+| 服务发现 | 容器停止后的表现 | 正确表达式 |
+|---|---|---|
+| static（gateway） | target 还在，抓取连接被拒 | `up == 0` |
+| dns_sd（user/order，支持 --scale） | DNS A 记录消失，target 整体缺席，`up` 指标不存在 | `absent(up{job="..."}) == 1` |
+
+**多副本时单个副本故障不触发 absent**（仍有存活 A 记录）——这不是缺陷而是特性：高可用把故障吸收掉了，业务无感就不该惊动人。想观测单副本退出，靠 Nacos 控制台或容器级监控（23.8）。
+
+### 23.6 故障注入演练
+
+```powershell
+.\scripts\fault-drill.ps1 -Scenario gateway        # 六选一：gateway / user-service / mysql / broker / seata / replica
+```
+
+每个场景统一骨架：打印观察清单 → 停组件 → 等告警 firing（无告警场景跑业务探针）→ 提示查收钉钉 → 起组件 → 等 resolved / 验证自动恢复。
+
+| 场景 | 预期告警 | 预期业务现象 | 恢复行为 |
+|---|---|---|---|
+| gateway | InstanceDown | 全部请求立即失败（9000 唯一入口） | resolved 通知 + 登录恢复 |
+| user-service | UserServiceDown(absent) | 登录/下单失败 | resolved + Nacos 重新注册 |
+| mysql | **无**（无 exporter） | 登录/下单 500，Loki 可查 HikariCP 断连异常 | Hikari 自动重连，**无需重启应用** |
+| broker | **无**（无 exporter） | 下单主链路（Seata 扣款）不受 MQ 影响；积分消息发送异常 | Broker 重新注册 NameServer |
+| seata | **无** | Seata 下单失败，但余额/订单数不变（AT 回滚保护） | TC 就绪后全局事务恢复 |
+| replica | **不 fire**（特性） | 双副本杀一个，业务无感 | Nacos 15~30s 摘除故障实例 |
+
+后四个场景刻意保留"无告警"的真实状态——它暴露了可观测性的边界：**Prometheus 只抓了三个微服务，基础设施（MySQL/Broker/Seata）是监控盲区**。这正是 23.8 要补的 exporter。故障注入的价值不只是验证告警，更是实证容错设计：mysql 场景验证连接池自愈，seata 场景验证 AT 回滚，replica 场景验证高可用。
+
+### 23.7 踩坑记录
+
+- **`send_resolved` 默认关闭**：不打开就只有 firing 通知、没有恢复通知。演练的正反馈闭环（故障→告警→修复→恢复通知）全靠它。
+- **适配器 webhook 路径形态**：`/dingtalk/<profile>/send`，profile 名必须和 dingtalk.yml 里的键名一致（本章都是 `study`），路径写错适配器返回 404 但 Alertmanager 只记日志不报警。
+- **凭证文件别入库**：dingtalk.yml 含 access_token+加签密钥，已加入 .gitignore；仓库里只留 dingtalk.yml.example 模板。泄露后果 = 任何人能往你的群发消息。
+- **写 alerts.yml 时 `$labels` 被 PowerShell 吞掉**（本章工程实测）：用双引号 here-string 拼接 YAML 时 `{{ $labels.job }}` 被当变量插值成空串，产物变成 `{{ \.job }}`。教训：含 `$` 的目标文本一律用**单引号 here-string** `@'...'@`。
+- **适配器 v2.1.0 的配置键是 `targets:` 不是 `profiles:`**（实测）：网上教程（含本仓库早期草稿）写的 profiles 是旧名，v2.1.0 起报 `field profiles not found`。官方示例见仓库 config.example.yml。flag 同理必须写 `--config.file`（双横线），单横线会被静默忽略、回退到找 CWD 下的 config.yml。
+- **Docker 加速器对"太新的 tag"会卡死不回源**（实测）：`prom/alertmanager:v0.34.1` 在三个加速器+quay 上全部挂起无输出，而有缓存的 v0.27.0/v0.28.1 秒下。对策：`docker pull docker.1ms.run/<镜像>:<tag>` 显式指定加速器 + 钉有次新缓存的版本（本章钉 v0.28.1）。
+- **验证告警别只盯钉钉**：`http://localhost:9090/api/v1/alerts`（Prometheus 侧状态）和 `http://localhost:9093/#/alerts`（Alertmanager 侧接收情况）分层排查——firing 没到 AM 是 prometheus.yml 的 alerting 段问题，到了 AM 没到钉钉是适配器/凭证问题。
+
+### 23.8 生产建议
+
+- **补基础设施 exporter**：`mysqld-exporter`、`rocketmq-exporter`（或 lag-pusher 扩指标），消除 23.6 暴露的监控盲区；容器级用 cAdvisor。
+- **分级路由**：critical → 电话/短信（如第三方 pager 服务），warning → 钉钉/邮件；配 `inhibit_rules` 让 critical 抑制同源 warning。
+- **时间参数调回生产值**：`group_wait: 30s~1m`、`repeat_interval: 4h~1d`；值夜班时配 `silences` 做维护窗口静默。
+- **适配器选型风险**：`prometheus-webhook-dingtalk` 已停止活跃维护（镜像仍可用）。替代：Grafana Alerting 原生钉钉 contact point，或自研一个几十行的 webhook 翻译服务。

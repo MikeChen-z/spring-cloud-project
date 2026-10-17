@@ -1,0 +1,15 @@
+# 钉钉适配器 profile 配置（prometheus-webhook-dingtalk，-config.file 加载）
+#
+# 本文件是模板：真实配置复制为 dingtalk.yml 后填入（含 access_token 与加签密钥，已 gitignore）：
+#   Copy-Item docker/alertmanager/dingtalk.yml.example docker/alertmanager/dingtalk.yml
+#
+# 凭证获取（钉钉 App，约 5 分钟）：
+#   建群 → 群设置 → 机器人 → 添加「自定义」机器人 → 安全设置勾选「加签」
+#   → 复制 webhook 地址（内含 access_token）和 SEC 开头的加签密钥
+#
+# study 是 profile 名，与 alertmanager.yml 中 webhook url 路径 /dingtalk/study/send 对应。
+
+targets:
+  study:
+    url: https://oapi.dingtalk.com/robot/send?access_token=<你的 access_token>
+    secret: <你的加签密钥，SEC 开头>
