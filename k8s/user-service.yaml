@@ -1,0 +1,88 @@
+# user-service 迁移清单（第 24 章：docker-compose → K8s）
+# 对照 compose 的改动只有三类：
+#   1) env 值全部指向 host.docker.internal（Pod 无法解析 compose 服务名，经宿主机映射端口回连）
+#   2) 健康检查从"容器自生自灭"变成显式探针（readiness 不就绪不接流量 / liveness 失败重启）
+#   3) 新增 prometheus.io/* 注解，供 Prometheus 的 kubernetes_sd_configs 自动发现（替代 compose 时代的 dns_sd 静态配置）
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: user-service
+  namespace: study
+  labels:
+    app: user-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: user-service
+  template:
+    metadata:
+      labels:
+        app: user-service
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8081"
+        prometheus.io/path: /actuator/prometheus
+    spec:
+      containers:
+        - name: user-service
+          image: user-service:1.0.0
+          # 本地构建的镜像没有 push 到任何 registry：
+          # 必须 IfNotPresent，否则默认 Always 会去 docker.io 拉取并直接 ImagePullBackOff
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8081
+          env:
+            # Nacos 2.x 客户端同时用 8848(HTTP) 和 9848(gRPC)，两个端口 compose 都已映射到宿主机
+            - name: NACOS_ADDR
+              value: host.docker.internal:8848
+            - name: MYSQL_HOST
+              value: host.docker.internal
+            - name: REDIS_HOST
+              value: host.docker.internal
+            - name: NAMESRV_ADDR
+              value: host.docker.internal:9876
+            - name: ZIPKIN_HOST
+              value: host.docker.internal
+            - name: SENTINEL_DASHBOARD
+              value: host.docker.internal:8858
+            # Sentinel 客户端启动即初始化（compose 时代同款，防懒加载看不到监控）
+            - name: SPRING_CLOUD_SENTINEL_EAGER
+              value: "true"
+          # 探针：initialDelaySeconds 给足 90s——Spring Boot 启动 + Nacos 注册慢，
+          # 给短了会在启动期被 liveness 误杀，陷入 CrashLoopBackOff 重启循环
+          readinessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8081
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            failureThreshold: 6
+          livenessProbe:
+            httpGet:
+              path: /actuator/health
+              port: 8081
+            initialDelaySeconds: 90
+            periodSeconds: 10
+            failureThreshold: 6
+          # requests/limits 对应 compose 的 mem_limit（user 512m）；
+          # 注意 Dockerfile 里 ENTRYPOINT 固定了 -Xmx，limits 只是容器级兜底，两者不冲突
+          resources:
+            requests:
+              memory: 256Mi
+            limits:
+              memory: 512Mi
+---
+# ClusterIP：集群内部地址，只有同集群的 gateway Pod 经 Nacos 发现后会访问它
+# （Nacos 注册的是 Pod IP，Service 在这里主要为 Prometheus 抓取和运维直查提供稳定入口）
+apiVersion: v1
+kind: Service
+metadata:
+  name: user-service
+  namespace: study
+spec:
+  selector:
+    app: user-service
+  ports:
+    - port: 8081
+      targetPort: 8081

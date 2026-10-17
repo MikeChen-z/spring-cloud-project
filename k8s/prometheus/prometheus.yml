@@ -1,0 +1,51 @@
+# Prometheus K8s 变体（第 24 章）
+# 与 docker/prometheus/prometheus.yml 的两点差异：
+#   1) 服务发现从 dns_sd/static 换成 kubernetes_sd_configs（role: pod + 注解过滤），
+#      Pod 重建换 IP 后目标自动更新——这是 Prometheus 进 K8s 的核心价值
+#   2) Alertmanager 仍留在 compose，alerting 目标指向 host.docker.internal:9093
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    environment: study
+
+rule_files:
+  - "alerts.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["host.docker.internal:9093"]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
+
+  # 只抓带 prometheus.io/scrape: "true" 注解的 Pod（三个微服务均已打注解）
+  - job_name: kubernetes-pods
+    kubernetes_sd_configs:
+      - role: pod
+    relabel_configs:
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_scrape]
+        action: keep
+        regex: "true"
+      # 指标路径取自注解 prometheus.io/path（/actuator/prometheus）
+      - source_labels: [__meta_kubernetes_pod_annotation_prometheus_io_path]
+        action: replace
+        target_label: __metrics_path__
+        regex: "(.+)"
+      # 抓取端口改写为注解 prometheus.io/port 指定的值
+      - source_labels: [__address__, __meta_kubernetes_pod_annotation_prometheus_io_port]
+        action: replace
+        regex: '([^:]+)(?::\d+)?;(\d+)'
+        replacement: '$1:$2'
+        target_label: __address__
+      # job 标签取 Pod 的 app 标签（user-service/order-service/gateway-service），
+      # 与 alerts.yml 中 absent(up{job="user-service"}) 等规则兼容——规则文件零改动复用
+      - source_labels: [__meta_kubernetes_pod_label_app]
+        action: replace
+        target_label: job
+      - source_labels: [__meta_kubernetes_pod_name]
+        action: replace
+        target_label: instance

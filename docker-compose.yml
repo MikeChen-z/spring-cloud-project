@@ -108,6 +108,10 @@ services:
       JVM_XMX: 256m
       JVM_MaxDirectMemorySize: 128m
       TZ: Asia/Shanghai
+      # 第 24 章：Seata Server 注册进 Nacos 的 IP 默认是 compose 容器 IP（172.20.x.x），
+      # K8s Pod 不可达。官方镜像支持 SEATA_IP 覆盖注册地址，
+      # 改成 host.docker.internal 后 Pod 经宿主 8091 端口映射回连 TC。
+      SEATA_IP: host.docker.internal
     ports:
       - "8091:8091"
       - "7091:7091"

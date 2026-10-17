@@ -78,6 +78,8 @@
 | `sql/seata_demo.sql` | — | order_db.t_order 建表；t_user 增加 balance 字段 |
 | `sql/rocketmq_demo.sql` | — | t_user 增加 points 字段 |
 | `sql/dlq_demo.sql` | — | order_db.t_dead_letter 死信记录表（可见 + 可补偿） |
+| `k8s/` | — | 第 24 章 K8s 清单：namespace + 三微服务 Deployment/Service + prometheus（RBAC/ConfigMap/Deployment/LB），基础设施仍留 compose |
+| `scripts/verify-k8s.ps1` | — | 第 24 章 K8s 版全链路验证（17 项：Pod 就绪 / 登录下单差值断言 / Prometheus SD targets / 告警状态） |
 
 ## 四、启动顺序
 
@@ -1985,3 +1987,103 @@ Copy-Item docker/alertmanager/dingtalk.yml.example docker/alertmanager/dingtalk.
 - **分级路由**：critical → 电话/短信（如第三方 pager 服务），warning → 钉钉/邮件；配 `inhibit_rules` 让 critical 抑制同源 warning。
 - **时间参数调回生产值**：`group_wait: 30s~1m`、`repeat_interval: 4h~1d`；值夜班时配 `silences` 做维护窗口静默。
 - **适配器选型风险**：`prometheus-webhook-dingtalk` 已停止活跃维护（镜像仍可用）。替代：Grafana Alerting 原生钉钉 contact point，或自研一个几十行的 webhook 翻译服务。
+
+## 二十四、微服务上 K8s：混合架构迁移实录
+
+第十二章用 Docker Compose 编排全部组件，本章把**三个微服务 + Prometheus** 迁移到 Docker Desktop 自带的 Kubernetes，基础设施（mysql/redis/nacos/broker/seata/alertmanager/grafana 等 14 个容器）继续留在 compose——学习成本最低的"混合架构"：K8s 先接管无状态业务 Pod，有状态中间件不搬。
+
+### 24.1 混合架构与回连通路
+
+```
+浏览器/脚本 ──localhost:9000──► [K8s] gateway-service (Service: LoadBalancer)
+                                     │ /api/users/**        │ /api/orders/**
+                                     ▼                      ▼
+                            [K8s] user-service   [K8s] order-service   ← Deployment 各 1 副本
+                                     │                      │
+              ┌──────────────────────┴──────────────────────┘
+              │  全部经 host.docker.internal（=192.168.65.254）回连宿主机映射端口
+              ▼
+   [compose] nacos:8848  mysql:3306  redis:6379  broker:10909/10911  seata:8091
+   [compose] alertmanager:9093 ◄── [K8s] prometheus 推告警也走这条路
+```
+
+- **注册发现**：Pod 注册到 Nacos 的是集群内 Pod IP（10.1.0.x），调用方（gateway/user/order）都在 K8s 内可直连；compose 侧已没有微服务调用方，不冲突。
+- **broker/seata 必须监听 0.0.0.0**：broker.conf 与 compose seata 的 `SEATA_IP` 调整后重建，netstat 确认 `0.0.0.0:10909`、`0.0.0.0:8091` LISTENING，否则 Pod 经宿主机回连被拒。
+- gateway Service `type: LoadBalancer` 在 Docker Desktop 上 EXTERNAL-IP 分配为 `localhost`——入口仍是 localhost:9000，全部脚本零改动。
+
+### 24.2 集群选型：kind 还是 kubeadm（离线实锤）
+
+| provider | 镜像来源 | 本机结果 |
+|---|---|---|
+| kind（新版默认） | 需在线拉 `kindest/node`（Docker Hub） | **失败**：Docker Hub 不通且无缓存，"Kubernetes failed to start" |
+| kubeadm（经典） | 组件镜像随 Docker Desktop 安装包内置 | 离线直接可用 |
+
+教训：网络受限环境先想清楚镜像从哪来，别只看"默认推荐"。
+
+### 24.3 清单设计（k8s/ 目录）
+
+| 文件 | 内容 |
+|---|---|
+| `k8s/00-namespace.yaml` | namespace `study` |
+| `k8s/user-service.yaml` / `order-service.yaml` / `gateway-service.yaml` | Deployment + Service。env 全指 `host.docker.internal`；`image: *-service:1.0.0` + `IfNotPresent`（镜像为 CI 构建产物 retag，见二十二章）；`prometheus.io/*` 注解供 SD 发现；readiness/liveness 探针 + resources |
+| `k8s/prometheus/rbac.yaml` | SA + ClusterRole + Binding：K8s SD 要调 API Server list/watch Pod，无 RBAC 返回 403 |
+| `k8s/prometheus/prometheus.yml` / `alerts.yml` | 以 ConfigMap `prometheus-config` 挂载进容器 |
+| `k8s/prometheus/deployment.yaml` | Deployment + LoadBalancer Service（9090） |
+
+微服务清单相对 compose 的关键改动只有两处：**env 指向 host.docker.internal**（替代 compose 服务名）、**补探针与 resources**（compose 时代没有探针概念）。
+
+### 24.4 Prometheus 进 K8s：kubernetes_sd 替代 dns_sd
+
+compose 时代用 `dns_sd_configs` 按服务名解析容器 IP；K8s 换成 `kubernetes_sd_configs role: pod` + 注解过滤（k8s/prometheus/prometheus.yml）：
+
+- 只抓带 `prometheus.io/scrape: "true"` 注解的 Pod；路径/端口取自 `prometheus.io/path`、`prometheus.io/port` 注解
+- `job` 标签改写为 Pod 的 app 标签 → alerts.yml 的 `absent(up{job="user-service"})` 等规则**零改动复用**
+- Alertmanager 仍在 compose：`alerting` 指 `host.docker.internal:9093`；Grafana 数据源已是 `http://host.docker.internal:9090`，零改动
+
+### 24.5 上线步骤（内存受限机器的实操顺序）
+
+```powershell
+kubectl apply -f k8s/00-namespace.yaml
+kubectl apply -f k8s/user-service.yaml -f k8s/order-service.yaml -f k8s/gateway-service.yaml
+kubectl apply -f k8s/prometheus/rbac.yaml
+kubectl create configmap prometheus-config -n study --from-file=k8s/prometheus/prometheus.yml --from-file=k8s/prometheus/alerts.yml
+kubectl apply -f k8s/prometheus/deployment.yaml
+
+docker compose stop user-service order-service gateway-service   # compose 侧微服务让位
+docker compose stop prometheus                                   # 释放宿主 9090
+
+# 内存受限关键操作：不要同时起 3 个 JVM！先全 scale 0 再逐个拉起（串行错峰）
+kubectl scale deploy --all -n study --replicas=0
+kubectl scale deploy/user-service -n study --replicas=1;    kubectl rollout status deploy/user-service -n study
+kubectl scale deploy/order-service -n study --replicas=1;   kubectl rollout status deploy/order-service -n study
+kubectl scale deploy/gateway-service -n study --replicas=1; kubectl rollout status deploy/gateway-service -n study
+
+powershell -File scripts/verify-k8s.ps1     # 17 项全绿即完成
+```
+
+### 24.6 自愈演练：delete pod（声明式 API 的核心体验）
+
+```powershell
+kubectl delete pod -n study -l app=user-service
+kubectl rollout status deploy/user-service -n study
+```
+
+实测：旧 Pod（10.1.0.59）删除后 ReplicaSet 立即补新 Pod（10.1.0.63，约 92s Ready）；Prometheus **零配置改动**自动把 target 切到新 IP 且 health=up；新 Pod 重跑 verify-k8s.ps1 依旧 17/17。对比 compose：`docker compose stop` 后没有东西替你拉起容器——**Desired State（期望副本数）才是 K8s 的灵魂**，kubectl 只是声明，调和循环负责兑现。
+
+### 24.7 踩坑记录（全部实测）
+
+- **liveness 探针杀死慢启动 JVM → CrashLoopBackOff**：内存受限时 JVM 启动 >30s，`initialDelaySeconds: 30 / failureThreshold: 3` 的 liveness 会在应用就绪前杀 Pod，死了重起、重起再杀。修法：liveness 放宽到 `initialDelaySeconds: 90 / failureThreshold: 6`（readiness 保持 20s 快上流量）。口诀：**readiness 管流量，liveness 管假死；启动慢先怪 liveness 太严**。
+- **多 JVM 并发启动撞内存峰值**：16GB 物理机 + WSL2 上限 7GB（`.wslconfig`：memory=7GB、autoMemoryReclaim=gradual），3 个 JVM 同起把 VM 压到换页、API Server 跟着 TLS 超时/500。串行扩容错峰解决；并把 zipkin/loki/promtail/sentinel 等可选组件 stop 再省 ~1GB。
+- **nacos 假死**：容器 "Up 23 minutes" 但 8848 不响应（内存挤压所致，日志停在 initialization），全部 Pod 注册失败，连锁报 gRPC 9848 "Network closed" + MySQL 握手 EOF。`docker restart nacos` 20s 恢复。教训：**compose ps 的 Up ≠ 服务可用**，排障先 curl 端口。
+- **`docker compose stop` 名单有错则原子失败**：stop 列表里混了个不存在的服务名，整条命令一个没停——报错后复查名单再执行，别以为停掉了。
+- **磁盘"占满"虚惊**：C 盘实余 60GB+，真身是 builder 缓存 ~10GB + 冗余镜像（旧 ACR sha 标签）。`docker builder prune` + 定向 `rmi` 清出 13.6GB；**禁用 `docker system prune -a`**——会误删 K8s 控制面镜像，集群直接报废。
+- **Windows PowerShell 5.1 三连坑**（verify-k8s.ps1）：① 不支持三元 `?:`（改 `$(if..)`）；② `Invoke-WebRequest` 没有 `-SkipHttpErrorCheck`（try/catch 合成响应对象）；③ **请求体默认 Latin-1 编码**——中文用户名"张三"被毁导致登录 401，必须 `ContentType='application/json; charset=utf-8'`。另外 `$ErrorActionPreference='Stop'` 会把 kubectl 的 stderr 提示变成终止错误（改 Continue）；含中文的脚本统一存 **UTF-8 with BOM**，否则 5.1 按 GBK 解读、乱码把引号吞成语法错误。
+- **登录响应取数路径**：token 在 `data.accessToken`，不是 `data` 直接为串——照抄旧脚本前先核对接口真实返回。
+
+### 24.8 生产建议
+
+- **基础设施渐进迁移**：先微服务后中间件；中间件用 Operator（MySQL/Redis Operator）或云托管，混合架构只是过渡态。
+- **探针三件套补齐**：本章只有 readiness/liveness；慢启动应用的正解是 startupProbe，比硬调 liveness 阈值优雅。
+- **resources 必填**：requests 是调度依据、limits 是防爆天花板；本章按 16GB 学习机调的 256~700Mi 没有普适性。
+- **入口用 Ingress**：生产用 Ingress 集中管域名/证书/路由，LoadBalancer 留给云厂商集成或 Docker Desktop 本地便利。
+- **可观测性栈整体化**：本章只搬了 Prometheus，alertmanager/grafana 仍在 compose——下一步用 kube-prometheus-stack（Helm chart）一次装齐，并配 Alertmanager 高可用。

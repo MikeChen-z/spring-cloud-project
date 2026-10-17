@@ -1,0 +1,5 @@
+# 第 24 章：所有 K8s 资源统一放在 study 命名空间，一键回滚 = kubectl delete namespace study
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: study

@@ -5,7 +5,8 @@ datasources:
   - name: Prometheus
     type: prometheus
     access: proxy
-    url: http://prometheus:9090
+    # 第 24 章：Prometheus 已迁 K8s（LoadBalancer 绑宿主 9090），compose 侧经 host.docker.internal 访问
+    url: http://host.docker.internal:9090
     isDefault: true
     editable: true
 
