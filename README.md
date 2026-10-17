@@ -1972,6 +1972,8 @@ Copy-Item docker/alertmanager/dingtalk.yml.example docker/alertmanager/dingtalk.
 - **`send_resolved` 默认关闭**：不打开就只有 firing 通知、没有恢复通知。演练的正反馈闭环（故障→告警→修复→恢复通知）全靠它。
 - **适配器 webhook 路径形态**：`/dingtalk/<profile>/send`，profile 名必须和 dingtalk.yml 里的键名一致（本章都是 `study`），路径写错适配器返回 404 但 Alertmanager 只记日志不报警。
 - **凭证文件别入库**：dingtalk.yml 含 access_token+加签密钥，已加入 .gitignore；仓库里只留 dingtalk.yml.example 模板。泄露后果 = 任何人能往你的群发消息。
+- **改完 dingtalk.yml 必须重启适配器**（实测）：prometheus-webhook-dingtalk 只在启动时加载一次配置，改完凭证要 `docker compose restart dingtalk-webhook`，否则新 token 永远不生效——日志里旧报错（300005）原样重复就是最明显信号。
+- **url 双重粘贴 → `token is not exist`**（实测）：把机器人设置页复制的完整 webhook 又粘到了模板残留的 `access_token=` 后面，拼出 `...access_token=https://oapi.dingtalk.com/robot/send?access_token=xxx` 的双重 URL（164 字符，正常 ≈115），钉钉侧收到垃圾 token 报 300005。正确形态：url = 完整 webhook 地址（整体只出现一次），secret = SEC 开头的加签密钥单独填。
 - **写 alerts.yml 时 `$labels` 被 PowerShell 吞掉**（本章工程实测）：用双引号 here-string 拼接 YAML 时 `{{ $labels.job }}` 被当变量插值成空串，产物变成 `{{ \.job }}`。教训：含 `$` 的目标文本一律用**单引号 here-string** `@'...'@`。
 - **适配器 v2.1.0 的配置键是 `targets:` 不是 `profiles:`**（实测）：网上教程（含本仓库早期草稿）写的 profiles 是旧名，v2.1.0 起报 `field profiles not found`。官方示例见仓库 config.example.yml。flag 同理必须写 `--config.file`（双横线），单横线会被静默忽略、回退到找 CWD 下的 config.yml。
 - **Docker 加速器对"太新的 tag"会卡死不回源**（实测）：`prom/alertmanager:v0.34.1` 在三个加速器+quay 上全部挂起无输出，而有缓存的 v0.27.0/v0.28.1 秒下。对策：`docker pull docker.1ms.run/<镜像>:<tag>` 显式指定加速器 + 钉有次新缓存的版本（本章钉 v0.28.1）。
