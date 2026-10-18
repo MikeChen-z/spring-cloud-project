@@ -12,7 +12,7 @@
 #
 # 设计说明：
 #   - gateway/user-service 用 docker compose stop/start（微服务无固定容器名，支持 scale）
-#   - mysql/broker/seata-server 用 docker stop/start（基础设施有固定容器名，更直观）
+#   - mysql/broker/seata 用 docker stop/start（基础设施有固定容器名，更直观）
 #   - 告警等待超时 150s：scrape 15s + for:30s + group_wait 10s + 余量
 [CmdletBinding()]
 param(
@@ -25,8 +25,8 @@ $baseUrl = 'http://localhost:9000'
 $promUrl = 'http://localhost:9090'
 
 function Write-Step($msg) { Write-Host "`n========== $msg ==========" -ForegroundColor Cyan }
-function Write-Ok($msg)   { Write-Host "  [OK] $msg" -ForegroundColor Green }
-function Write-Bad($msg)  { Write-Host "  [!!] $msg" -ForegroundColor Red }
+function Write-Ok($msg) { Write-Host "  [OK] $msg" -ForegroundColor Green }
+function Write-Bad($msg) { Write-Host "  [!!] $msg" -ForegroundColor Red }
 function Write-Info($msg) { Write-Host "  $msg" -ForegroundColor DarkGray }
 
 # 轮询 Prometheus 告警 API，直到指定 alertname firing（$true）或超时（$false）
@@ -37,7 +37,8 @@ function Wait-AlertFiring([string]$alertName, [int]$timeoutSec = 150) {
             $resp = Invoke-RestMethod -Uri "$promUrl/api/v1/alerts" -TimeoutSec 5
             $hit = @($resp.data.alerts | Where-Object { $_.labels.alertname -eq $alertName -and $_.state -eq 'firing' })
             if ($hit.Count -gt 0) { return $true }
-        } catch { Write-Info "查询 Prometheus 失败（继续等）：$($_.Exception.Message)" }
+        }
+        catch { Write-Info "查询 Prometheus 失败（继续等）：$($_.Exception.Message)" }
         Start-Sleep -Seconds 5
     }
     return $false
@@ -51,7 +52,8 @@ function Wait-AlertResolved([string]$alertName, [int]$timeoutSec = 150) {
             $resp = Invoke-RestMethod -Uri "$promUrl/api/v1/alerts" -TimeoutSec 5
             $hit = @($resp.data.alerts | Where-Object { $_.labels.alertname -eq $alertName })
             if ($hit.Count -eq 0) { return $true }
-        } catch { Write-Info "查询 Prometheus 失败（继续等）：$($_.Exception.Message)" }
+        }
+        catch { Write-Info "查询 Prometheus 失败（继续等）：$($_.Exception.Message)" }
         Start-Sleep -Seconds 5
     }
     return $false
@@ -61,15 +63,16 @@ function Wait-AlertResolved([string]$alertName, [int]$timeoutSec = 150) {
 function Test-Login {
     try {
         $r = Invoke-RestMethod -Uri "$baseUrl/api/login" -Method Post -TimeoutSec 8 `
-             -ContentType 'application/json' -Body '{"username":"张三","password":"123456"}'
+            -ContentType 'application/json; charset=utf-8' -Body '{"username":"张三","password":"123456"}'
         return ($r.code -eq 200)
-    } catch { return $false }
+    }
+    catch { return $false }
 }
 
 # 登录并返回 token（下单探针用）
 function Get-Token {
     $r = Invoke-RestMethod -Uri "$baseUrl/api/login" -Method Post -TimeoutSec 8 `
-         -ContentType 'application/json' -Body '{"username":"张三","password":"123456"}'
+        -ContentType 'application/json; charset=utf-8' -Body '{"username":"张三","password":"123456"}'
     return $r.data.accessToken
 }
 
@@ -148,9 +151,10 @@ try {
             $before = [decimal](Get-DbValue 'SELECT balance FROM study_cloud.t_user WHERE id=1')
             try {
                 $r = Invoke-RestMethod -Uri "$baseUrl/api/orders/seata/create?userId=1&amount=1" -Method Post `
-                     -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 15
+                    -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 15
                 Write-Ok "下单接口返回 code=$($r.code)（Seata 主链路不依赖 Broker，符合预期）"
-            } catch { Write-Info "下单返回异常：$($_.Exception.Message)（发送失败上抛也属可观察行为）" }
+            }
+            catch { Write-Info "下单返回异常：$($_.Exception.Message)（发送失败上抛也属可观察行为）" }
             $after = [decimal](Get-DbValue 'SELECT balance FROM study_cloud.t_user WHERE id=1')
             Write-Info "余额 $before -> $after"
             docker start broker | Out-Null
@@ -168,24 +172,26 @@ try {
             Write-Step '场景 seata：停 Seata TC → 全局事务失败回滚、余额不变 → 恢复'
             Write-Info '预期：无实例级告警；Seata 下单超时/500，但余额/订单数不变（AT 回滚保护）'
             $b0 = [decimal](Get-DbValue 'SELECT balance FROM study_cloud.t_user WHERE id=1')
-            docker stop seata-server | Out-Null
+            docker stop seata | Out-Null
             Start-Sleep -Seconds 5
             $token = Get-Token
             try {
                 $r = Invoke-RestMethod -Uri "$baseUrl/api/orders/seata/create?userId=1&amount=1" -Method Post `
-                     -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 30
+                    -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 30
                 Write-Bad "下单居然成功 code=$($r.code)（TC 不在不应成功）"
-            } catch { Write-Ok '下单失败/超时（符合预期：TM 拿不到 TC）' }
+            }
+            catch { Write-Ok '下单失败/超时（符合预期：TM 拿不到 TC）' }
             $b1 = [decimal](Get-DbValue 'SELECT balance FROM study_cloud.t_user WHERE id=1')
             if ($b1 -eq $b0) { Write-Ok "余额未变（$b0 -> $b1）：AT 回滚保护生效" } else { Write-Bad "余额变了：$b0 -> $b1" }
-            docker start seata-server | Out-Null
+            docker start seata | Out-Null
             Write-Info '已重启 seata-server，等待 TC 就绪（jraft 启动较慢）...'
             Start-Sleep -Seconds 30
             try {
                 $r = Invoke-RestMethod -Uri "$baseUrl/api/orders/seata/create?userId=1&amount=1" -Method Post `
-                     -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 30
+                    -Headers @{ Authorization = "Bearer $token" } -TimeoutSec 30
                 if ($r.data.success) { Write-Ok '恢复后下单 200，全局事务已恢复' } else { Write-Bad "下单 code=$($r.code)" }
-            } catch { Write-Bad "恢复后下单仍失败：$($_.Exception.Message)" }
+            }
+            catch { Write-Bad "恢复后下单仍失败：$($_.Exception.Message)" }
         }
 
         'replica' {
@@ -216,6 +222,7 @@ try {
         }
     }
     Write-Step "场景 $Scenario 演练完成"
-} finally {
+}
+finally {
     Pop-Location
 }
