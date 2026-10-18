@@ -356,20 +356,27 @@ Check "USER 访问 /api/admin/users -> 403" ($r3.status -eq 403 -and $r3.json.co
 Write-Host "  RBAC: 网关 PermissionGlobalFilter 按 auth.permission-rules 做路径-角色匹配" -ForegroundColor DarkGray
 Write-Host "  规则: /api/admin/** -> [ADMIN]，未匹配规则的路径默认放行" -ForegroundColor DarkGray
 
-# ========== 15. Token 刷新机制（access + refresh 双令牌） ==========
-Write-Step "15. Token 刷新机制（双令牌）"
+# ========== 15. Token 刷新机制（access + refresh 双令牌，refresh 一次一换） ==========
+Write-Step "15. Token 刷新机制（双令牌 + 轮转）"
 
-# 用 refreshToken 刷新 → 返回新 accessToken
+# 用 refreshToken 刷新 → 200，并同时返回新 accessToken 和新 refreshToken（轮转）
 $r = Send-Request "POST" "$baseUrl/api/refresh" @{ refreshToken = $refreshToken } $null
 Check "refresh token 换新 access token -> 200" ($r.status -eq 200 -and $r.json.data.accessToken) "status=$($r.status)"
 $newAccessToken = $r.json.data.accessToken
+$newRefreshToken = $r.json.data.refreshToken
+Check "轮转生效：返回新 refreshToken 且不同于旧值" ($newRefreshToken -and $newRefreshToken -ne $refreshToken) "是否已轮转=$([bool]($newRefreshToken -ne $refreshToken))"
 
-# 用新 accessToken 访问接口 → 200
+# 重放刚被轮转掉的旧 refreshToken → 401（重放检测：判定泄露，吊销该用户整条刷新链）
+$r = Send-Request "POST" "$baseUrl/api/refresh" @{ refreshToken = $refreshToken } $null
+Check "重放已轮转的旧 refreshToken -> 401（重放检测）" ($r.status -eq 401) "status=$($r.status)"
+
+# 用新 accessToken 访问接口 → 200（吊销只作废刷新链，已签发的 access token 到期前仍有效）
 $r = Send-Request "GET" "$baseUrl/api/orders/1" $null $newAccessToken
 Check "新 access token 访问接口 -> 200" ($r.status -eq 200) "status=$($r.status)"
 
 Write-Host "  双令牌: access(30min)用于业务鉴权, refresh(7d)用于刷新access" -ForegroundColor DarkGray
-Write-Host "  refresh token 存 Redis(key=refresh:{userId}), 刷新时校验值匹配" -ForegroundColor DarkGray
+Write-Host "  轮转: 每次刷新签发新 refreshToken(key=refresh:{userId})，旧值留档 refresh:rotated:{userId}" -ForegroundColor DarkGray
+Write-Host "  重放检测: 已轮转的旧值再次出现 → 判定泄露，删除 refresh:{userId} 吊销整条刷新链" -ForegroundColor DarkGray
 
 Start-Sleep -Seconds 3
 # ========== 16. 登出 + Redis 黑名单（主动吊销） ==========
@@ -383,7 +390,7 @@ Check "登出 -> 200" ($r.status -eq 200) "status=$($r.status)"
 $r = Send-Request "GET" "$baseUrl/api/orders/1" $null $token
 Check "登出后旧 token -> 401" ($r.status -eq 401 -and $r.json.code -eq 401) "status=$($r.status) code=$($r.json.code)"
 
-# 用旧 refreshToken 刷新 → 401（refresh 已删除）
+# 用已失效的 refreshToken 刷新 → 401（第 15 节重放检测已吊销 refresh:{userId}，登出又清理了一次）
 $r = Send-Request "POST" "$baseUrl/api/refresh" @{ refreshToken = $refreshToken } $null
 Check "登出后旧 refreshToken -> 401" ($r.status -eq 401) "status=$($r.status)"
 
